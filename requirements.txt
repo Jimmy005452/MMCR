@@ -1,0 +1,7 @@
+# torch
+# torchvision
+timm
+pyyaml
+tqdm
+# torchgeo
+scipy
