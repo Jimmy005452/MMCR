@@ -1,0 +1,25 @@
+{
+  "mnist": {
+    "acc": 0.9203,
+    "num_classes": 10
+  },
+  "svhn": {
+    "acc": 0.8388905961893055,
+    "num_classes": 10
+  },
+  "gtsrb": {
+    "acc": 0.8679334916864608,
+    "num_classes": 43
+  },
+  "eurosat": {
+    "acc": 0.7002222222222222,
+    "num_classes": 10
+  },
+  "dtd": {
+    "acc": 0.6824468085106383,
+    "num_classes": 47
+  },
+  "average": {
+    "acc": 0.8019586237217254
+  }
+}

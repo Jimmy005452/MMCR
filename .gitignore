@@ -8,6 +8,7 @@ data/
 checkpoints/
 outputs/
 runs/
+synthesis_data/generated*/
 
 *.pt
 *.pth

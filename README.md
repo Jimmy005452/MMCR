@@ -49,6 +49,7 @@ Top-level executable code is kept minimal: `eval.py` is the evaluation entry poi
 Other runnable tools are grouped by purpose:
 
 - `source_models/`: train source encoders and save zeroshot weights.
+- `synthesis_data/`: generate synthetic inputs and teacher logits for data-free experiments.
 - `model_merging/`: Task Arithmetic, TIES, DARE, NAN, and AdaMerging scripts.
 - `rl_methods/`: RL-based model merging packages.
 - `analysis_tools/`: task-vector inspection utilities.

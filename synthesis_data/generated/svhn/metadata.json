@@ -1,0 +1,38 @@
+{
+  "dataset": "svhn",
+  "normalized_dataset": "svhn",
+  "num_classes": 10,
+  "num_samples": 64,
+  "accepted_samples": 64,
+  "accepted_ratio": 1.0,
+  "target_match_rate": 1.0,
+  "mean_confidence": 0.93310546875,
+  "mean_entropy": 0.307373046875,
+  "max_entropy": 1.7197265625,
+  "min_confidence": 0.485595703125,
+  "image_size": 224,
+  "arch": "vit_large_patch14_clip_224.openai",
+  "encoder_path": "checkpoints/svhn/encoder.pt",
+  "head_path": "checkpoints/svhn/head.pt",
+  "files": {
+    "inputs": "synthesis_data/generated/svhn/inputs.pt",
+    "pixels": "synthesis_data/generated/svhn/pixels.pt",
+    "teacher_logits": "synthesis_data/generated/svhn/teacher_logits.pt",
+    "pseudo_labels": "synthesis_data/generated/svhn/pseudo_labels.pt",
+    "accepted_mask": "synthesis_data/generated/svhn/accepted_mask.pt"
+  },
+  "synthesis": {
+    "steps": 150,
+    "lr": 0.05,
+    "entropy_coef": 0.05,
+    "consistency_coef": 0.05,
+    "tv_coef": 0.0002,
+    "l2_coef": 0.0001,
+    "aug_shift": 8,
+    "aug_noise_std": 0.03,
+    "samples_per_dataset": 64,
+    "samples_per_class": 0,
+    "batch_size": 16,
+    "seed": 42
+  }
+}
