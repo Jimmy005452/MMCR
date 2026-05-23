@@ -11,7 +11,6 @@ The proposal uses 8 vision datasets:
 | --- | --- |
 | `sun397` | SUN397 |
 | `stanford_cars` | Stanford Cars |
-| `cars` | Stanford Cars alias |
 | `resisc45` | RESISC45 |
 | `eurosat` | EuroSAT |
 | `svhn` | SVHN |
@@ -20,7 +19,7 @@ The proposal uses 8 vision datasets:
 | `dtd` | DTD |
 
 `eurosat`, `svhn`, `gtsrb`, `mnist`, and `dtd` are loaded with torchvision.
-Only `sun397`, `cars`, and `resisc45` use the local AdaMerging-style layout:
+Only `sun397`, `stanford_cars`, and `resisc45` use the local AdaMerging-style layout:
 
 ```text
 data/
@@ -44,32 +43,63 @@ data/
 python -m pip install -r requirements.txt
 ```
 
+## Project Layout
+
+Top-level executable code is kept minimal: `eval.py` is the evaluation entry point.
+Other runnable tools are grouped by purpose:
+
+- `source_models/`: train source encoders and save zeroshot weights.
+- `model_merging/`: Task Arithmetic, TIES, DARE, NAN, and AdaMerging scripts.
+- `rl_methods/`: RL-based model merging packages.
+- `analysis_tools/`: task-vector inspection utilities.
+- `hf_tools/`: Hugging Face checkpoint comparison and conversion tools.
+- `mmcr/`: shared helper library used by the scripts above.
+
+Each tool folder has its own `README.md` with commands.
+
 ## Train One Dataset
 
 ```powershell
-python train_vit_l16.py --dataset mnist --data-root data --output-dir checkpoints --epochs 10 --batch-size 16
+python -m source_models.train_vit_l16 --dataset mnist --data-root data --output-dir checkpoints --epochs 10 --batch-size 16
 ```
 
 Common options:
 
 ```powershell
 # Use GPU 2
-python train_vit_l16.py --dataset mnist --gpu 2 --amp
+python -m source_models.train_vit_l16 --dataset mnist --gpu 2 --amp
 
 # Disable the learning-rate scheduler
-python train_vit_l16.py --dataset mnist --scheduler none
+python -m source_models.train_vit_l16 --dataset mnist --scheduler none
 
 # Also save the pretrained encoder as checkpoints/zeroshot.pt
-python train_vit_l16.py --dataset mnist --save-zeroshot
+python -m source_models.train_vit_l16 --dataset mnist --save-zeroshot
 
 # Print all options with defaults
-python train_vit_l16.py -h
+python -m source_models.train_vit_l16 -h
 ```
 
 ## Train All 8 Source Models
 
-```powershell
-.\scripts\train_all_vit_l16.ps1
+Run this from the repository root:
+
+```bash
+for dataset in sun397 stanford_cars resisc45 eurosat svhn gtsrb mnist dtd; do
+  python -m source_models.train_vit_l16 \
+    --dataset "$dataset" \
+    --data-root data \
+    --output-dir checkpoints \
+    --epochs 10 \
+    --batch-size 64 \
+    --gpu 0 \
+    --amp
+done
+```
+
+Save the zeroshot encoder once if it is not already available:
+
+```bash
+python -m source_models.save_zeroshot --output checkpoints/zeroshot.pt
 ```
 
 The checkpoints will be saved under:
@@ -181,19 +211,48 @@ loss, acc = evaluate(model, loader, nn.CrossEntropyLoss(), device, amp=True)
 
 ```powershell
 # Single dataset: encoder + that dataset's head
-python eval_main.py --encoder checkpoints/mnist/encoder.pt --datasets mnist --checkpoint-root checkpoints --data-root data --batch-size 64 --gpu 0 --amp
+python eval.py --encoder checkpoints/mnist/encoder.pt --datasets mnist --checkpoint-root checkpoints --data-root data --batch-size 64 --gpu 0 --amp
 
 # Same encoder, different dataset heads
-python eval_main.py --encoder checkpoints/task_arithmetic/encoder_scale_0.3.pt --datasets mnist svhn gtsrb --checkpoint-root checkpoints --data-root data --batch-size 64 --gpu 0 --amp
+python eval.py --encoder checkpoints/task_arithmetic/encoder_scale_0.3.pt --datasets mnist svhn gtsrb --checkpoint-root checkpoints --data-root data --batch-size 64 --gpu 0 --amp
 ```
 
-Suggested future scripts:
+Cache single-source baselines and compare a merged encoder against them.
+When `--datasets` is omitted, `eval.py` automatically reads datasets from
+`results.json` next to the merged `encoder.pt`:
 
-```text
-merge_baselines.py   -> import mmcr.checkpoints, mmcr.models, and mmcr.data
-evaluate_model.py    -> import mmcr.checkpoints and mmcr.engine.evaluate
-mmcr_toy.py          -> import model/data/checkpoint helpers and implement RL search only
+```powershell
+python eval.py \
+  --encoder rl_mmcr_PPO_GAE_Actor-Critic_runs/mnist_svhn_gtsrb_eurosat_dtd/encoder.pt \
+  --checkpoint-root checkpoints \
+  --data-root data \
+  --batch-size 64 \
+  --gpu 0 \
+  --amp \
+  --single-model-results-json results/single_model_baselines_mnist_svhn_gtsrb_eurosat_dtd.json \
+  --results-json results/merged_mnist_svhn_gtsrb_eurosat_dtd.json \
+  --comparison-json results/merged_vs_single_mnist_svhn_gtsrb_eurosat_dtd.json \
+  --comparison-txt results/merged_vs_single_mnist_svhn_gtsrb_eurosat_dtd.txt
 ```
+
+If the run metadata lives somewhere else, pass it explicitly:
+
+```powershell
+python eval.py \
+  --encoder outputs/encoder.pt \
+  --run-results-json rl_mmcr_PPO_GAE_Actor-Critic_runs/mnist_svhn_gtsrb_eurosat_dtd/results.json \
+  --checkpoint-root checkpoints \
+  --data-root data \
+  --single-model-results-json results/single_model_baselines_mnist_svhn_gtsrb_eurosat_dtd.json
+```
+
+`--single-model-results-json` stores each dataset source encoder accuracy.
+If the file already exists, cached datasets are reused and only missing datasets
+are evaluated. Add `--refresh-single-model-results` to recompute the cache. The
+comparison table reports single-source accuracy, merged accuracy, per-dataset
+difference, and average accuracy difference. You can still pass `--datasets`
+manually to override automatic detection.
+
 
 ## Notes
 

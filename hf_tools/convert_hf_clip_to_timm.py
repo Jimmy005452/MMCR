@@ -5,7 +5,10 @@ from pathlib import Path
 import torch
 
 from mmcr.models import DEFAULT_ARCH, build_image_encoder
-from compare_hf_timm_checkpoint import download_repo, find_weight_file, load_hf_state_dict, safe_repo_dir
+try:
+    from hf_tools.compare_hf_timm_checkpoint import download_repo, find_weight_file, load_hf_state_dict, safe_repo_dir
+except ImportError:
+    from compare_hf_timm_checkpoint import download_repo, find_weight_file, load_hf_state_dict, safe_repo_dir
 
 
 DEFAULT_REPOS = [
@@ -20,7 +23,7 @@ DEFAULT_REPOS = [
 ]
 
 DATASET_NAME_MAP = {
-    "stanford-cars": "cars",
+    "stanford-cars": "stanford_cars",
 }
 
 

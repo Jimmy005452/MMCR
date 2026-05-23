@@ -17,13 +17,13 @@ It intentionally uses the shared `mmcr` package and does not import from
 ## Run
 
 ```powershell
-python -m rl_mmcr_PPO_GAE_Actor-Critic.train --datasets mnist svhn --checkpoint-root checkpoints --data-root data --output-dir rl_mmcr_PPO_GAE_Actor-Critic_runs/mnist_svhn --episodes 100 --rollouts-per-update 4 --ppo-epochs 4 --reward-batch-size 4 --reward-batches-per-dataset 1 --log-every 10 --gpu 0 --amp
+python -m rl_methods.rl_mmcr_PPO_GAE_Actor-Critic.train --datasets mnist svhn --checkpoint-root checkpoints --data-root data --output-dir rl_mmcr_PPO_GAE_Actor-Critic_runs/mnist_svhn --episodes 100 --rollouts-per-update 4 --ppo-epochs 4 --reward-batch-size 4 --reward-batches-per-dataset 1 --log-every 10 --gpu 0 --amp
 ```
 
 For a quick smoke run:
 
 ```powershell
-python -m rl_mmcr_PPO_GAE_Actor-Critic.train --datasets mnist svhn --checkpoint-root checkpoints --data-root data --output-dir rl_mmcr_PPO_GAE_Actor-Critic_runs/debug --episodes 20 --rollouts-per-update 2 --ppo-epochs 2 --reward-batch-size 2 --reward-batches-per-dataset 1 --log-every 5 --gpu 0 --amp --skip-final-eval
+python -m rl_methods.rl_mmcr_PPO_GAE_Actor-Critic.train --datasets mnist svhn --checkpoint-root checkpoints --data-root data --output-dir rl_mmcr_PPO_GAE_Actor-Critic_runs/debug --episodes 20 --rollouts-per-update 2 --ppo-epochs 2 --reward-batch-size 2 --reward-batches-per-dataset 1 --log-every 5 --gpu 0 --amp --skip-final-eval
 ```
 
 Outputs are saved under `--output-dir`:
