@@ -1,8 +1,5 @@
-import os
 import argparse
 from pathlib import Path
-
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import torch
 import torch.nn as nn
@@ -10,8 +7,16 @@ import torch.optim as optim
 
 from mmcr.data import build_loaders
 from mmcr.engine import evaluate, train_one_epoch
-from mmcr.models import DEFAULT_ARCH, build_model, build_model_transforms, load_classification_head, load_image_encoder, save_encoder, save_head
-from mmcr.utils import seed_everything, write_json, write_metrics
+from mmcr.checkpoints import (
+    ENCODER_FILE,
+    HEAD_FILE,
+    load_classification_head,
+    load_image_encoder,
+    save_encoder,
+    save_head,
+)
+from mmcr.models import DEFAULT_ARCH, build_model, build_model_transforms
+from mmcr.utils import build_device, seed_everything, write_json, write_metrics
 
 
 def build_grad_scaler(device, amp_enabled: bool):
@@ -22,26 +27,49 @@ def build_grad_scaler(device, amp_enabled: bool):
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+def build_scheduler(optimizer, args):
+    if args.scheduler == "none":
+        return None
+    if args.scheduler == "cosine":
+        return optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.min_lr,
+        )
+    raise ValueError(f"Unsupported scheduler: {args.scheduler}")
+
+
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", required=True)
-    parser.add_argument("--data-root", default="data")
-    parser.add_argument("--output-dir", default="checkpoints")
-    parser.add_argument("--arch", default=DEFAULT_ARCH)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--min-lr", type=float, default=1e-7)
-    parser.add_argument("--weight-decay", type=float, default=0.05)
-    parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--amp", action="store_true")
-    parser.add_argument("--freeze-encoder", action="store_true")
-    parser.add_argument("--freeze-head", action="store_true")
-    parser.add_argument("--encoder-checkpoint", default=None)
-    parser.add_argument("--head-checkpoint", default=None)
-    parser.add_argument("--resume-dir", default=None)
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    data_args = parser.add_argument_group("data")
+    data_args.add_argument("--dataset", required=True)
+    data_args.add_argument("--data-root", default="data")
+    data_args.add_argument("--output-dir", default="checkpoints")
+
+    model_args = parser.add_argument_group("model")
+    model_args.add_argument("--arch", default=DEFAULT_ARCH)
+    model_args.add_argument("--encoder-checkpoint", default=None)
+    model_args.add_argument("--head-checkpoint", default=None)
+    model_args.add_argument("--resume-dir", default=None)
+    model_args.add_argument("--freeze-encoder", action="store_true")
+    model_args.add_argument("--freeze-head", action="store_true")
+    model_args.add_argument("--save-zeroshot", action="store_true")
+
+    train_args = parser.add_argument_group("training")
+    train_args.add_argument("--epochs", type=int, default=10)
+    train_args.add_argument("--batch-size", type=int, default=16)
+    train_args.add_argument("--lr", type=float, default=1e-5)
+    train_args.add_argument("--weight-decay", type=float, default=0.05)
+    train_args.add_argument("--grad-accum-steps", type=int, default=1)
+    train_args.add_argument("--scheduler", choices=["cosine", "none"], default="cosine")
+    train_args.add_argument("--min-lr", type=float, default=1e-7)
+
+    runtime_args = parser.add_argument_group("runtime")
+    runtime_args.add_argument("--gpu", type=int, default=0, help="CUDA GPU index. Use -1 for CPU.")
+    runtime_args.add_argument("--num-workers", type=int, default=4)
+    runtime_args.add_argument("--seed", type=int, default=42)
+    runtime_args.add_argument("--amp", action="store_true")
     return parser.parse_args()
 
 
@@ -49,8 +77,16 @@ def main():
     args = parse_args()
     seed_everything(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = build_device(args.gpu)
+    if device.type == "cuda":
+        print(f"Using device: {device} ({torch.cuda.get_device_name(device)})")
+    else:
+        print("Using device: cpu")
+
     train_transform, eval_transform, data_config = build_model_transforms(args.arch, pretrained=True)
+    output_dir = Path(args.output_dir)
+    run_dir = output_dir / args.dataset
+
     train_loader, val_loader, num_classes = build_loaders(
         args.dataset,
         Path(args.data_root),
@@ -62,11 +98,14 @@ def main():
     )
 
     model = build_model(num_classes, arch=args.arch).to(device)
+    zeroshot_path = output_dir / "zeroshot.pt"
+    if args.save_zeroshot and not zeroshot_path.exists():
+        save_encoder(zeroshot_path, model)
 
     if args.resume_dir is not None:
         resume_dir = Path(args.resume_dir)
-        resume_encoder = resume_dir / "finetuned_encoder.pt"
-        resume_head = resume_dir / "head.pt"
+        resume_encoder = resume_dir / ENCODER_FILE
+        resume_head = resume_dir / HEAD_FILE
 
         if args.encoder_checkpoint is None and resume_encoder.exists():
             args.encoder_checkpoint = str(resume_encoder)
@@ -83,8 +122,7 @@ def main():
     if args.head_checkpoint is not None:
         model.classification_head = load_classification_head(
             args.head_checkpoint,
-            in_features=model.image_encoder.num_features,
-            num_classes=num_classes,
+            fallback_head=model.classification_head,
             map_location="cpu",
         ).to(device)
 
@@ -95,20 +133,19 @@ def main():
         model.freeze_head()
 
     criterion = nn.CrossEntropyLoss()
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable parameters. Do not freeze both encoder and head.")
+
     optimizer = optim.AdamW(
-        [param for param in model.parameters() if param.requires_grad],
+        trainable_params,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
-        eta_min=args.min_lr,
-    )
+    scheduler = build_scheduler(optimizer, args)
     scaler = build_grad_scaler(device, args.amp)
 
-    run_dir = Path(args.output_dir) / args.dataset
-    best_acc = 0.0
+    best_acc = -1.0
     history = []
 
     for epoch in range(1, args.epochs + 1):
@@ -136,9 +173,13 @@ def main():
 
         if val_acc > best_acc:
             best_acc = val_acc
-            save_encoder(run_dir / "finetuned_encoder.pt", model)
+            if args.freeze_encoder:
+                print("Encoder is frozen; skipping encoder save.")
+            else:
+                save_encoder(run_dir / ENCODER_FILE, model)
             if not args.freeze_head:
-                save_head(run_dir / "head.pt", model)
+                save_head(run_dir / HEAD_FILE, model)
+            print(f"Saved checkpoint to {run_dir} in best acc {best_acc:.4f}.")
             write_json(
                 run_dir / "metadata.json",
                 {
@@ -156,11 +197,9 @@ def main():
                     "args": vars(args),
                 },
             )
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
-    # save_encoder(run_dir / "last_encoder.pt", model)
-    # if not args.freeze_head:
-    #     save_head(run_dir / "last_head.pt", model)
     print(f"Done. Best validation accuracy: {best_acc:.4f}")
 
 

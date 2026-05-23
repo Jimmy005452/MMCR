@@ -7,38 +7,35 @@ checkpoints are intended to be merged later by baseline methods and MMCR.
 
 The proposal uses 8 vision datasets:
 
-- SUN397
-- Stanford Cars
-- RESISC45
-- EuroSAT
-- SVHN
-- GTSRB
-- MNIST
-- DTD
+| Dataset key | Dataset |
+| --- | --- |
+| `sun397` | SUN397 |
+| `stanford_cars` | Stanford Cars |
+| `cars` | Stanford Cars alias |
+| `resisc45` | RESISC45 |
+| `eurosat` | EuroSAT |
+| `svhn` | SVHN |
+| `gtsrb` | GTSRB |
+| `mnist` | MNIST |
+| `dtd` | DTD |
 
-`RESISC45` is not available as `torchvision.datasets.RESISC45` in this
-environment. This project uses TorchGeo to download/extract it when available,
-then reads the extracted files as an ImageFolder dataset.
-
-Automatic download:
-
-```powershell
-python -m pip install torchgeo
-python train_vit_l16.py --dataset resisc45 --data-root data --output-dir checkpoints --epochs 10 --batch-size 16 --amp
-```
-
-Expected extracted format:
+`eurosat`, `svhn`, `gtsrb`, `mnist`, and `dtd` are loaded with torchvision.
+Only `sun397`, `cars`, and `resisc45` use the local AdaMerging-style layout:
 
 ```text
 data/
+  sun397/
+    train/class_name/image.jpg
+    test/class_name/image.jpg
+  stanford_cars/
+    devkit/
+    cars_train/
+    cars_test/
   resisc45/
+    resisc45-train.txt
+    resisc45-test.txt
     NWPU-RESISC45/
-      airplane/
-        image_001.jpg
-        ...
-      airport/
-        image_001.jpg
-        ...
+      class_name/image.jpg
 ```
 
 ## Setup
@@ -53,6 +50,22 @@ python -m pip install -r requirements.txt
 python train_vit_l16.py --dataset mnist --data-root data --output-dir checkpoints --epochs 10 --batch-size 16
 ```
 
+Common options:
+
+```powershell
+# Use GPU 2
+python train_vit_l16.py --dataset mnist --gpu 2 --amp
+
+# Disable the learning-rate scheduler
+python train_vit_l16.py --dataset mnist --scheduler none
+
+# Also save the pretrained encoder as checkpoints/zeroshot.pt
+python train_vit_l16.py --dataset mnist --save-zeroshot
+
+# Print all options with defaults
+python train_vit_l16.py -h
+```
+
 ## Train All 8 Source Models
 
 ```powershell
@@ -63,18 +76,26 @@ The checkpoints will be saved under:
 
 ```text
 checkpoints/
-  mnist/best.pt
-  svhn/best.pt
+  zeroshot.pt
+  mnist/
+    encoder.pt
+    head.pt
+    metadata.json
+    metrics.json
+  svhn/
+    encoder.pt
+    head.pt
+    metadata.json
+    metrics.json
   ...
 ```
 
-Each checkpoint stores:
+The weight files are intentionally split:
 
-- model weights
-- dataset name
-- number of classes
-- best validation accuracy
-- training arguments
+- `zeroshot.pt` stores the original pretrained encoder before fine-tuning.
+- `encoder.pt` stores the fine-tuned image encoder for one dataset.
+- `head.pt` stores that dataset's classification head.
+- `metadata.json` and `metrics.json` store run information and training history.
 
 ## Reuse Modules in Merging or Evaluation
 
@@ -84,7 +105,7 @@ Future merging scripts should reuse these instead of rewriting dataset/model cod
 ### Load a Dataset
 
 ```python
-from mmcr.data import build_eval_loader, build_loaders
+from mmcr.data import build_loader, build_loaders
 
 train_loader, val_loader, num_classes = build_loaders(
     dataset_key="mnist",
@@ -92,9 +113,10 @@ train_loader, val_loader, num_classes = build_loaders(
     batch_size=16,
 )
 
-eval_loader, num_classes = build_eval_loader(
+eval_loader, num_classes = build_loader(
     dataset_key="mnist",
     data_root="data",
+    split="val",
     batch_size=16,
 )
 ```
@@ -103,12 +125,20 @@ eval_loader, num_classes = build_eval_loader(
 
 ```python
 import torch
-from mmcr.models import build_model, load_model_from_checkpoint
+from mmcr.checkpoints import load_classification_head, load_image_encoder
+from mmcr.models import build_model
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = build_model(num_classes=10).to(device)
-model, ckpt = load_model_from_checkpoint("checkpoints/mnist/best.pt", device=device)
+model.image_encoder = load_image_encoder(
+    "checkpoints/mnist/encoder.pt",
+    fallback_encoder=model.image_encoder,
+).to(device)
+model.classification_head = load_classification_head(
+    "checkpoints/mnist/head.pt",
+    fallback_head=model.classification_head,
+).to(device)
 ```
 
 The model is an `ImageClassifier`:
@@ -128,22 +158,41 @@ different numbers of classes.
 
 ```python
 import torch.nn as nn
-from mmcr.data import build_eval_loader
+from mmcr.checkpoints import load_classification_head, load_image_encoder
+from mmcr.data import build_loader
 from mmcr.engine import evaluate
-from mmcr.models import load_model_from_checkpoint
+from mmcr.models import build_model
 
 device = "cuda"
-model, ckpt = load_model_from_checkpoint("checkpoints/mnist/best.pt", device=device)
-loader, _ = build_eval_loader("mnist", "data", batch_size=16)
+model = build_model(num_classes=10).to(device)
+model.image_encoder = load_image_encoder(
+    "checkpoints/mnist/encoder.pt",
+    fallback_encoder=model.image_encoder,
+).to(device)
+model.classification_head = load_classification_head(
+    "checkpoints/mnist/head.pt",
+    fallback_head=model.classification_head,
+).to(device)
+loader, _ = build_loader("mnist", "data", split="val", batch_size=16)
 loss, acc = evaluate(model, loader, nn.CrossEntropyLoss(), device, amp=True)
+```
+
+### Evaluate an Encoder
+
+```powershell
+# Single dataset: encoder + that dataset's head
+python eval_main.py --encoder checkpoints/mnist/encoder.pt --datasets mnist --checkpoint-root checkpoints --data-root data --batch-size 64 --gpu 0 --amp
+
+# Same encoder, different dataset heads
+python eval_main.py --encoder checkpoints/task_arithmetic/encoder_scale_0.3.pt --datasets mnist svhn gtsrb --checkpoint-root checkpoints --data-root data --batch-size 64 --gpu 0 --amp
 ```
 
 Suggested future scripts:
 
 ```text
-merge_baselines.py   -> import mmcr.models and mmcr.data
-evaluate_model.py    -> import mmcr.engine.evaluate
-mmcr_toy.py          -> import model/data helpers and implement RL search only
+merge_baselines.py   -> import mmcr.checkpoints, mmcr.models, and mmcr.data
+evaluate_model.py    -> import mmcr.checkpoints and mmcr.engine.evaluate
+mmcr_toy.py          -> import model/data/checkpoint helpers and implement RL search only
 ```
 
 ## Notes

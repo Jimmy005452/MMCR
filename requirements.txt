@@ -1,7 +1,8 @@
 # torch
 # torchvision
 timm
-pyyaml
 tqdm
-# torchgeo
 scipy
+huggingface_hub
+safetensors
+matplotlib

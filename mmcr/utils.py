@@ -16,6 +16,16 @@ def accuracy(logits, targets) -> float:
     return (preds == targets).float().mean().item()
 
 
+def build_device(gpu: int):
+    if gpu < 0 or not torch.cuda.is_available():
+        return torch.device("cpu")
+
+    if gpu >= torch.cuda.device_count():
+        raise ValueError(f"GPU index {gpu} is unavailable. Found {torch.cuda.device_count()} CUDA device(s).")
+
+    return torch.device(f"cuda:{gpu}")
+
+
 def write_metrics(path: Path, rows) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
