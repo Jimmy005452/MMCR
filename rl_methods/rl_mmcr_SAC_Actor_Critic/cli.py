@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     model.add_argument("--policy-hidden-dim", type=int, default=128)
     model.add_argument("--critic-hidden-dim", type=int, default=256)
     model.add_argument("--merge-granularity", choices=["layer", "global"], default="layer")
+    model.add_argument(
+        "--state-mode",
+        choices=["minimal", "full_coefficients"],
+        default="minimal",
+        help="State representation used by policy/value networks.",
+    )
     model.add_argument("--coefficient-mode", choices=["positive"], default="positive")
     model.add_argument("--coefficient-init", type=float, default=0.3)
     model.add_argument("--export-policy", choices=["best", "final"], default="best")
@@ -44,6 +50,10 @@ def parse_args() -> argparse.Namespace:
         help="Number of environment steps sampled from independent Uniform(0, 1) positive coefficients before SAC updates use the actor.",
     )
     train.add_argument("--updates-per-step", type=int, default=1)
+    train.add_argument("--actor-update-delay", type=int, default=1, help="Update the actor once every N critic updates. Values >1 make SAC more TD3-like and reduce critic exploitation.")
+    train.add_argument("--freeze-actor-during-random-steps", action="store_true", help="Collect random replay and train only critics until --random-steps is exhausted.")
+    train.add_argument("--action-anchor-coef", type=float, default=0.0, help="Penalty coefficient for keeping actor-sampled coefficients near --coefficient-init.")
+    train.add_argument("--cql-coef", type=float, default=0.0, help="Conservative Q penalty coefficient. Penalizes actor-sampled actions whose Q exceeds replay-action Q.")
     train.add_argument("--tau", type=float, default=0.005)
     train.add_argument("--alpha", type=float, default=0.02)
     train.add_argument("--auto-alpha", action="store_true")
@@ -83,6 +93,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "--batch-size": args.batch_size,
         "--replay-size": args.replay_size,
         "--updates-per-step": args.updates_per_step,
+        "--actor-update-delay": args.actor_update_delay,
     }
     for name, value in positive_ints.items():
         if value <= 0:
@@ -99,3 +110,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--log-std-min must be smaller than --log-std-max.")
     if args.activation_reward_coef < 0:
         raise ValueError("--activation-reward-coef must be non-negative.")
+    if args.action_anchor_coef < 0:
+        raise ValueError("--action-anchor-coef must be non-negative.")
+    if args.cql_coef < 0:
+        raise ValueError("--cql-coef must be non-negative.")

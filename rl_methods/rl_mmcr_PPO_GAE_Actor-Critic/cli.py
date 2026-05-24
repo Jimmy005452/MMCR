@@ -37,6 +37,12 @@ def parse_args() -> argparse.Namespace:
         help="Use layer for layer-wise coefficients or global for one coefficient vector shared by all layers.",
     )
     model.add_argument(
+        "--state-mode",
+        choices=["minimal", "full_coefficients"],
+        default="minimal",
+        help="State representation used by policy/value networks.",
+    )
+    model.add_argument(
         "--coefficient-mode",
         choices=["positive"],
         default="positive",

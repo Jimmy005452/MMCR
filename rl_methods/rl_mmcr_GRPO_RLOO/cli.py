@@ -24,6 +24,12 @@ def parse_args() -> argparse.Namespace:
     model.add_argument("--arch", default=DEFAULT_ARCH)
     model.add_argument("--policy-hidden-dim", type=int, default=128)
     model.add_argument("--merge-granularity", choices=["global"], default="global")
+    model.add_argument(
+        "--state-mode",
+        choices=["minimal", "full_coefficients"],
+        default="minimal",
+        help="State representation used by policy/value networks.",
+    )
     model.add_argument("--coefficient-mode", choices=["positive"], default="positive")
     model.add_argument("--coefficient-init", type=float, default=0.3)
     model.add_argument("--export-policy", choices=["best", "final"], default="best")

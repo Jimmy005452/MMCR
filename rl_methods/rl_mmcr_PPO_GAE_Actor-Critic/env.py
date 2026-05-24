@@ -47,11 +47,14 @@ class RLMMCREnv:
         merge_granularity: str = "layer",
         source_baseline_scores: dict[str, float] | None = None,
         activation_reward_coef: float = 0.0,
+        state_mode: str = "minimal",
     ):
         if reward_eval_interval <= 0:
             raise ValueError("reward_eval_interval must be positive.")
         if merge_granularity not in {"layer", "global"}:
             raise ValueError("merge_granularity must be either 'layer' or 'global'.")
+        if state_mode not in {"minimal", "full_coefficients"}:
+            raise ValueError("state_mode must be either 'minimal' or 'full_coefficients'.")
 
         self.encoder = encoder
         self.heads = nn.ModuleDict(heads)
@@ -69,6 +72,7 @@ class RLMMCREnv:
         self.coefficient_mode = coefficient_mode
         self.merge_granularity = merge_granularity
         self.activation_reward_coef = float(activation_reward_coef)
+        self.state_mode = state_mode
 
         self.num_layers = layered_task_vectors.num_layers
         self.num_models = layered_task_vectors.num_models
@@ -115,7 +119,11 @@ class RLMMCREnv:
 
     @property
     def state_dim(self) -> int:
-        return 3 * self.num_models + 1
+        if self.state_mode == "minimal":
+            return 3 * self.num_models + 1
+        if self.state_mode == "full_coefficients":
+            return 1 + 2 * self.num_models + self.num_layers * self.num_models + self.num_layers
+        raise RuntimeError(f"Unknown state_mode: {self.state_mode}")
 
     def reset(self) -> torch.Tensor:
         self.layer_index = 0
@@ -219,14 +227,25 @@ class RLMMCREnv:
             layer_progress = torch.tensor([(self.layer_index + 1) / max(1, self.num_layers)], dtype=torch.float32)
             layer_geometry = self.layer_geometry_features[self.layer_index]
 
-        return torch.cat(
-            [
+        if self.state_mode == "minimal":
+            parts = [
                 layer_progress,
                 layer_geometry,
                 self._mean_coefficients_so_far(),
-            ],
-            dim=0,
-        )
+            ]
+        elif self.state_mode == "full_coefficients":
+            filled_mask = torch.zeros(self.num_layers, dtype=torch.float32)
+            filled_mask[: min(self.layer_index, self.num_layers)] = 1.0
+            parts = [
+                layer_progress,
+                layer_geometry,
+                self.coefficients_by_layer.float().reshape(-1),
+                filled_mask,
+            ]
+        else:
+            raise RuntimeError(f"Unknown state_mode: {self.state_mode}")
+
+        return torch.cat(parts, dim=0)
 
     def _reward_for_step(self, done: bool):
         reward_evaluated = done or (

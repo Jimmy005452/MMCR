@@ -135,6 +135,7 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
         merge_granularity=args.merge_granularity,
         source_baseline_scores=source_baseline_scores,
         activation_reward_coef=args.activation_reward_coef,
+        state_mode=args.state_mode,
     )
 
 

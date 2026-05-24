@@ -89,6 +89,75 @@ To avoid recomputing source-model retention denominators at startup, first run
 `python -m rl_methods.source_baselines ...` from the parent README and pass the
 result with `--source-baseline-json`.
 
+## State Mode
+
+Use `--state-mode full_coefficients` when testing whether SAC can learn a stable Q function from the current partial merge. Compared with the default `minimal` state, this exposes the full layer-by-task coefficient table plus a mask indicating which layers have already been filled.
+
+For 8 datasets and 27 merge layers:
+
+```text
+minimal state: 25 dims
+full_coefficients state: 260 dims
+```
+
+Recommended SAC diagnostic setting:
+
+```bash
+--state-mode full_coefficients \
+--activation-reward-coef 0.0
+```
+
+## Conservative Actor Updates
+
+SAC can overestimate Q and let the actor exploit unreliable critic regions. These options make the actor update more conservative while still training the critics from replay:
+
+```bash
+--freeze-actor-during-random-steps \
+--actor-update-delay 4 \
+--action-anchor-coef 0.05 \
+--cql-coef 0.1
+```
+
+- `--freeze-actor-during-random-steps`: random warmup fills replay and updates critics, but the actor is not changed until `--random-steps` is exhausted.
+- `--actor-update-delay`: updates the actor once every N critic updates.
+- `--action-anchor-coef`: penalizes actor-sampled coefficients moving far from `--coefficient-init`.
+- `--cql-coef`: adds a conservative Q penalty when actor-sampled actions have higher Q than replay actions.
+
+The log now prints `q`, `tq` (target Q), `vloss` (critic loss including CQL), `cql` (conservative penalty), `bell` (Bellman loss), `ploss` (actor loss), and `au` (actor updates in that episode). These same values are saved in `results.json` as `q_mean`, `target_q_mean`, `value_loss`, `cql_loss`, `bellman_loss`, `policy_loss`, and `actor_updates`.
+
+Recommended debugging run for 8-dataset layer-wise SAC:
+
+```bash
+nohup python3 -m rl_methods.rl_mmcr_SAC_Actor_Critic.train \
+  --datasets sun397 stanford_cars resisc45 eurosat svhn gtsrb mnist dtd \
+  --checkpoint-root checkpoints \
+  --data-root data \
+  --source-baseline-json results/source_baselines_8datasets_test.json \
+  --output-dir rl_mmcr_SAC_Actor_Critic_runs/layer8_fullstate_conservative_seed2029 \
+  --merge-granularity layer \
+  --state-mode full_coefficients \
+  --episodes 300 \
+  --reward-batch-size 64 \
+  --reward-batches-per-dataset 1 \
+  --reward-eval-interval 13 \
+  --batch-size 128 \
+  --random-steps 1000 \
+  --updates-per-step 1 \
+  --actor-update-delay 4 \
+  --freeze-actor-during-random-steps \
+  --action-anchor-coef 0.05 \
+  --cql-coef 0.1 \
+  --alpha 0.005 \
+  --lr 1e-4 \
+  --critic-lr 1e-4 \
+  --activation-reward-coef 0.0 \
+  --log-every 5 \
+  --seed 2029 \
+  --gpu 0 \
+  --amp \
+  > sac_layer8_fullstate_conservative_seed2029.log 2>&1 &
+```
+
 ## Activation Reward
 
 Add dense layer-wise activation guidance with a small coefficient:

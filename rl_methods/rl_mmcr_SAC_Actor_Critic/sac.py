@@ -136,6 +136,10 @@ class SACStats:
     q_mean: float
     target_q_mean: float
     log_prob_mean: float
+    actor_updated: bool = False
+    action_anchor_loss: float = 0.0
+    cql_loss: float = 0.0
+    bellman_loss: float = 0.0
 
 
 class SACAgent:
@@ -158,6 +162,8 @@ class SACAgent:
         log_std_min: float,
         log_std_max: float,
         initial_coefficient: float,
+        action_anchor_coef: float,
+        cql_coef: float,
         device: torch.device,
     ):
         self.device = device
@@ -165,6 +171,9 @@ class SACAgent:
         self.tau = float(tau)
         self.auto_alpha = bool(auto_alpha)
         self.target_entropy = float(target_entropy) if target_entropy is not None else -float(action_dim)
+        self.action_anchor_coef = float(action_anchor_coef)
+        self.cql_coef = float(cql_coef)
+        self.initial_action = torch.full((1, action_dim), float(initial_coefficient), device=device)
 
         self.actor = PositiveSoftplusActor(
             state_dim,
@@ -204,7 +213,7 @@ class SACAgent:
     def deterministic_action(self, state: torch.Tensor) -> torch.Tensor:
         return self.actor.deterministic(state.unsqueeze(0).to(self.device)).squeeze(0).clamp(min=0.0, max=10.0)
 
-    def update(self, replay: ReplayBuffer, batch_size: int) -> SACStats:
+    def update(self, replay: ReplayBuffer, batch_size: int, update_actor: bool = True) -> SACStats:
         batch = replay.sample(batch_size, self.device)
         batch = TransitionBatch(
             batch.states,
@@ -227,9 +236,33 @@ class SACAgent:
 
         current_q1 = self.critic1(batch.states, batch.actions)
         current_q2 = self.critic2(batch.states, batch.actions)
-        critic_loss = F.mse_loss(current_q1, target) + F.mse_loss(current_q2, target)
+        bellman_loss = F.mse_loss(current_q1, target) + F.mse_loss(current_q2, target)
+        cql_loss = torch.zeros((), device=self.device)
+        if self.cql_coef > 0.0:
+            with torch.no_grad():
+                cql_actions, _ = self.actor.sample(batch.states)
+                cql_actions = torch.nan_to_num(cql_actions, nan=0.0, posinf=10.0, neginf=0.0).clamp(min=0.0, max=10.0)
+            cql_q1 = self.critic1(batch.states, cql_actions)
+            cql_q2 = self.critic2(batch.states, cql_actions)
+            cql_loss = (
+                F.softplus(cql_q1 - current_q1.detach()).mean()
+                + F.softplus(cql_q2 - current_q2.detach()).mean()
+            )
+        critic_loss = bellman_loss + self.cql_coef * cql_loss
         if not torch.isfinite(critic_loss):
-            return SACStats(0.0, float("nan"), 0.0, float(self.alpha.detach().item()), 0.0, float(target.mean().item()), 0.0)
+            return SACStats(
+                0.0,
+                float("nan"),
+                0.0,
+                float(self.alpha.detach().item()),
+                0.0,
+                float(target.mean().item()),
+                0.0,
+                False,
+                0.0,
+                float(cql_loss.detach().item()),
+                float(bellman_loss.detach().item()) if torch.isfinite(bellman_loss) else float("nan"),
+            )
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         nn.utils.clip_grad_norm_(list(self.critic1.parameters()) + list(self.critic2.parameters()), max_norm=5.0)
@@ -241,31 +274,51 @@ class SACAgent:
         q1 = self.critic1(batch.states, actions)
         q2 = self.critic2(batch.states, actions)
         q = torch.nan_to_num(torch.min(q1, q2), nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
-        actor_loss = (self.alpha.detach() * log_probs - q).mean()
-        if not torch.isfinite(actor_loss):
-            return SACStats(0.0, float(critic_loss.item()), 0.0, float(self.alpha.detach().item()), float(q.mean().item()), float(target.mean().item()), float(log_probs.mean().item()))
-        self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
-        nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5.0)
-        self.actor_optimizer.step()
+        action_anchor_loss = (actions - self.initial_action.expand_as(actions)).pow(2).mean()
+        actor_loss = (self.alpha.detach() * log_probs - q).mean() + self.action_anchor_coef * action_anchor_loss
+        alpha_loss = torch.zeros((), device=self.device)
+        actor_updated = False
 
-        if self.auto_alpha:
-            alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
-            self.alpha_optimizer.zero_grad(set_to_none=True)
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-        else:
-            alpha_loss = torch.zeros((), device=self.device)
+        if update_actor:
+            if not torch.isfinite(actor_loss):
+                return SACStats(
+                    0.0,
+                    float(critic_loss.item()),
+                    0.0,
+                    float(self.alpha.detach().item()),
+                    float(q.mean().item()),
+                    float(target.mean().item()),
+                    float(log_probs.mean().item()),
+                    False,
+                    float(action_anchor_loss.detach().item()),
+                    float(cql_loss.detach().item()),
+                    float(bellman_loss.detach().item()),
+                )
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5.0)
+            self.actor_optimizer.step()
+            actor_updated = True
+
+            if self.auto_alpha:
+                alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
+                self.alpha_optimizer.zero_grad(set_to_none=True)
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
 
         self._soft_update_targets()
         return SACStats(
-            actor_loss=float(actor_loss.item()),
+            actor_loss=float(actor_loss.item()) if actor_updated else 0.0,
             critic_loss=float(critic_loss.item()),
             alpha_loss=float(alpha_loss.item()),
             alpha=float(self.alpha.detach().item()),
             q_mean=float(q.detach().mean().item()),
             target_q_mean=float(target.detach().mean().item()),
             log_prob_mean=float(log_probs.detach().mean().item()),
+            actor_updated=actor_updated,
+            action_anchor_loss=float(action_anchor_loss.detach().item()),
+            cql_loss=float(cql_loss.detach().item()),
+            bellman_loss=float(bellman_loss.detach().item()),
         )
 
     @torch.no_grad()

@@ -71,6 +71,10 @@ def zero_stats(alpha: float) -> SACStats:
         q_mean=0.0,
         target_q_mean=0.0,
         log_prob_mean=0.0,
+        actor_updated=False,
+        action_anchor_loss=0.0,
+        cql_loss=0.0,
+        bellman_loss=0.0,
     )
 
 
@@ -147,6 +151,7 @@ def train(args, env, agent: SACAgent, replay: ReplayBuffer):
     episode_history = []
     random_steps_remaining = args.random_steps
     total_steps = 0
+    update_step = 0
     last_stats = zero_stats(args.alpha)
     progress = tqdm(total=args.episodes, desc="RL-MMCR-SAC")
 
@@ -156,10 +161,16 @@ def train(args, env, agent: SACAgent, replay: ReplayBuffer):
         episode_history.append(summarize_episode(episode, episode_index, best_sample))
 
         updates = 0
+        actor_updates = 0
         if replay.size >= args.batch_size:
             for _ in range(args.updates_per_step * int(episode["steps"])):
-                last_stats = agent.update(replay, args.batch_size)
+                update_step += 1
+                warmup_done = random_steps_remaining <= 0
+                actor_allowed = warmup_done or not args.freeze_actor_during_random_steps
+                update_actor = actor_allowed and update_step % args.actor_update_delay == 0
+                last_stats = agent.update(replay, args.batch_size, update_actor=update_actor)
                 updates += 1
+                actor_updates += int(last_stats.actor_updated)
 
         history_row = {
             "update": episode_index + 1,
@@ -168,6 +179,7 @@ def train(args, env, agent: SACAgent, replay: ReplayBuffer):
             "total_steps": total_steps,
             "replay_size": replay.size,
             "updates": updates,
+            "actor_updates": actor_updates,
             "sample_average": float(episode["average"]),
             "sample_retention": float(episode["reward_stats"]["mean_retention"]),
             "sample_objective": float(episode["objective"]),
@@ -199,7 +211,10 @@ def train(args, env, agent: SACAgent, replay: ReplayBuffer):
                 f"best={format_retention(best_sample['mean_retention'])} "
                 f"deterministic={format_retention(deterministic_retention)} "
                 f"{format_scores(episode['scores'], args.datasets)} "
-                f"reward={history_row['reward_sum']:.4f} q={last_stats.q_mean:.4f} alpha={last_stats.alpha:.4f}"
+                f"reward={history_row['reward_sum']:.4f} q={last_stats.q_mean:.4f} "
+                f"tq={last_stats.target_q_mean:.4f} vloss={last_stats.critic_loss:.4f} "
+                f"cql={last_stats.cql_loss:.4f} bell={last_stats.bellman_loss:.4f} "
+                f"ploss={last_stats.actor_loss:.4f} au={actor_updates} alpha={last_stats.alpha:.4f}"
             )
 
         update_history.append(history_row)
@@ -209,6 +224,10 @@ def train(args, env, agent: SACAgent, replay: ReplayBuffer):
             best=format_retention(best_sample["mean_retention"]),
             reward=f"{history_row['reward_sum']:.4f}",
             q=f"{last_stats.q_mean:.4f}",
+            tq=f"{last_stats.target_q_mean:.4f}",
+            vloss=f"{last_stats.critic_loss:.4f}",
+            cql=f"{last_stats.cql_loss:.4f}",
+            au=actor_updates,
             alpha=f"{last_stats.alpha:.4f}",
         )
 
@@ -313,6 +332,8 @@ def main() -> None:
         log_std_min=args.log_std_min,
         log_std_max=args.log_std_max,
         initial_coefficient=args.coefficient_init,
+        action_anchor_coef=args.action_anchor_coef,
+        cql_coef=args.cql_coef,
         device=device,
     )
     replay = ReplayBuffer(env.state_dim, env.num_models, args.replay_size)

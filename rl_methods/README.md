@@ -112,6 +112,21 @@ python -m rl_methods.rl_mmcr_GRPO_RLOO.train \
 
 The GRPO/RLOO implementation lives in `rl_methods/rl_mmcr_GRPO_RLOO/`.
 
+## State Modes
+
+All RL methods support `--state-mode`:
+
+- `minimal`: current compact state. It contains layer progress, current-layer task-vector geometry, and the mean coefficients used so far. For 8 datasets this is 25 dimensions.
+- `full_coefficients`: adds the full layer-by-task coefficient table and a filled-layer mask. For 8 datasets with 27 merge layers this is 260 dimensions. This is mainly intended for SAC/PPO critics, because the value/Q network can see the partial merged-model configuration instead of only local layer information.
+
+Start SAC/PPO debugging with:
+
+```bash
+--state-mode full_coefficients
+```
+
+GRPO has no value network, so `minimal` is usually enough unless you want a controlled comparison.
+
 ## Source Baseline Cache
 
 Use this once to evaluate each source model on the full test split and save the
