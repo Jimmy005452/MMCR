@@ -1,4 +1,5 @@
 from pathlib import Path
+import gc
 
 import torch
 import torch.nn as nn
@@ -34,23 +35,89 @@ def vector_to_delta_state(vector: torch.Tensor, reference_state: dict[str, torch
     return delta_state
 
 
+def _stream_merge_keys(pretrained_state: dict[str, torch.Tensor], finetuned_paths: list[Path | str], map_location="cpu"):
+    keys = [key for key, value in pretrained_state.items() if torch.is_floating_point(value)]
+    for path in finetuned_paths:
+        state = load_state_dict(path, map_location=map_location)
+        kept = []
+        for key in keys:
+            if key not in state:
+                print(f"Warning: {key} is missing from {path}; skipping.", flush=True)
+                continue
+            if state[key].shape != pretrained_state[key].shape:
+                print(f"Warning: {key} has mismatched shape in {path}; skipping.", flush=True)
+                continue
+            kept.append(key)
+        keys = kept
+        del state
+        gc.collect()
+    return keys
+
+
+def _trim_vector(vector: torch.Tensor, top_k_percent: float) -> torch.Tensor:
+    if not 0 < top_k_percent <= 100:
+        raise ValueError("top_k_percent must be in (0, 100].")
+    if top_k_percent == 100:
+        return vector
+
+    keep = max(1, int(vector.numel() * top_k_percent / 100))
+    trimmed = torch.zeros_like(vector)
+    _, indices = torch.topk(vector.abs(), k=keep, largest=True)
+    trimmed[indices] = vector[indices]
+    return trimmed
+
+
 def load_ties_task_vectors(
     zeroshot_path: Path | str,
     finetuned_paths: list[Path | str],
     top_k_percent: float = 20,
     map_location="cpu",
 ):
+    """Load per-task TIES vectors with a lower RAM peak.
+
+    The original implementation loaded all fine-tuned checkpoints, flattened all
+    of them, and materialized dense task-vector matrices at once. That is very
+    memory hungry for 8 ViT-L checkpoints. This version streams checkpoints in
+    two passes: first to elect TIES signs, then to build selected delta states.
+    """
     pretrained_state = load_state_dict(zeroshot_path, map_location=map_location)
-    finetuned_states = [load_state_dict(path, map_location=map_location) for path in finetuned_paths]
-    keys = get_merge_keys(pretrained_state, finetuned_states)
+    paths = [Path(path) for path in finetuned_paths]
+    keys = _stream_merge_keys(pretrained_state, paths, map_location=map_location)
 
-    print(f"Flattening {len(finetuned_states)} checkpoints over {len(keys)} floating-point tensors.")
-    flat_pretrained = state_dict_to_vector(pretrained_state, keys)
-    flat_finetuned = torch.vstack([state_dict_to_vector(state, keys) for state in finetuned_states])
-    task_vectors = flat_finetuned - flat_pretrained.unsqueeze(0)
-    selected_vectors = ties_select_task_vectors(task_vectors, top_k_percent=top_k_percent)
+    print(f"Streaming {len(paths)} checkpoints over {len(keys)} floating-point tensors.", flush=True)
+    flat_pretrained = state_dict_to_vector(pretrained_state, keys).float()
+    positive = torch.zeros_like(flat_pretrained)
+    negative = torch.zeros_like(flat_pretrained)
 
-    delta_states = [vector_to_delta_state(vector, pretrained_state, keys) for vector in selected_vectors]
+    for index, path in enumerate(paths, start=1):
+        print(f"TIES sign pass {index}/{len(paths)}: {path}", flush=True)
+        state = load_state_dict(path, map_location=map_location)
+        task_vector = state_dict_to_vector(state, keys).float() - flat_pretrained
+        trimmed = _trim_vector(task_vector, top_k_percent=top_k_percent)
+        positive += trimmed.clamp(min=0).abs()
+        negative += trimmed.clamp(max=0).abs()
+        del state, task_vector, trimmed
+        gc.collect()
+
+    elected = torch.where(positive >= negative, torch.ones_like(positive), -torch.ones_like(negative))
+    del positive, negative
+    gc.collect()
+
+    delta_states = []
+    for index, path in enumerate(paths, start=1):
+        print(f"TIES select pass {index}/{len(paths)}: {path}", flush=True)
+        state = load_state_dict(path, map_location=map_location)
+        task_vector = state_dict_to_vector(state, keys).float() - flat_pretrained
+        trimmed = _trim_vector(task_vector, top_k_percent=top_k_percent)
+        sign_matches = torch.sign(trimmed) == elected
+        nonzero = trimmed != 0
+        selected = trimmed * (sign_matches & nonzero & (elected != 0))
+        delta_states.append(vector_to_delta_state(selected, pretrained_state, keys))
+        del state, task_vector, trimmed, sign_matches, nonzero, selected
+        gc.collect()
+
+    del flat_pretrained, elected
+    gc.collect()
     return pretrained_state, delta_states, keys
 
 

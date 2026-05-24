@@ -6,13 +6,12 @@ from pathlib import Path
 import torch
 
 from mmcr.adamerging import load_ties_task_vectors
-from mmcr.task_vectors import load_state_dict
 
 
 @dataclass(frozen=True)
 class LayeredTaskVectors:
     pretrained_state: dict[str, torch.Tensor]
-    finetuned_states: list[dict[str, torch.Tensor]]
+    finetuned_paths: list[Path]
     task_vectors: list[dict[str, torch.Tensor]]
     task_names: list[str]
     layer_names: list[str]
@@ -66,7 +65,7 @@ def load_layered_ties_task_vectors(
     layer_names, layer_to_keys = _group_layers(task_vectors)
     return LayeredTaskVectors(
         pretrained_state=pretrained_state,
-        finetuned_states=[load_state_dict(path, map_location=map_location) for path in finetuned_paths],
+        finetuned_paths=[Path(path) for path in finetuned_paths],
         task_vectors=task_vectors,
         task_names=task_names,
         layer_names=layer_names,

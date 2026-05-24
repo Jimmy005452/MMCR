@@ -89,6 +89,7 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
         coefficient_mode=args.coefficient_mode,
         coefficient_init=args.coefficient_init,
         cache_task_vectors_device=args.cache_task_vectors_device,
+        merge_granularity=args.merge_granularity,
     )
 
 
@@ -250,7 +251,8 @@ def export_results(args, env: RLMMCREnv, model: HybridActorCritic, best_sample: 
         "num_models": env.num_models,
         "num_layers": env.num_layers,
         "layer_names": env.layer_names,
-        "action_type": "hybrid_binary_selection_continuous_weights",
+        "action_type": args.action_mode,
+        "merge_granularity": args.merge_granularity,
         "exported_policy": exported_policy,
         "final_policy": final_policy,
         "best_sample": best_sample,
@@ -296,6 +298,7 @@ def main() -> None:
         hidden_dim=args.policy_hidden_dim,
         coefficient_mode=args.coefficient_mode,
         coefficient_init=args.coefficient_init,
+        action_mode=args.action_mode,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 

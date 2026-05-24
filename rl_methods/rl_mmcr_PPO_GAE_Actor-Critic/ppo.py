@@ -187,16 +187,18 @@ def deterministic_policy_result(env: RLMMCREnv, model: HybridActorCritic, gate_t
         state = state.to(env.device)
 
     final_coefficients = torch.tensor(coefficient_history, dtype=torch.float32)
+    expanded_coefficients = env.expand_coefficients(final_coefficients)
     terminal_info = infos[-1]
     return {
         "selected": selected_history,
         "coefficients": coefficient_history,
+        "expanded_coefficients": expanded_coefficients.tolist(),
         "average": float(env.previous_average),
         "objective": float(terminal_info["objective"]),
         "scores": dict(env.previous_scores),
         "infos": infos,
         "coefficients_by_layer": coefficients_to_dict(
-            final_coefficients,
+            expanded_coefficients,
             env.layer_names,
             env.layered_task_vectors.task_names,
         ),

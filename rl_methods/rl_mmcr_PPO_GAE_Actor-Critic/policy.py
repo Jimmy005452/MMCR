@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 
 COEFFICIENT_MODES = {"softmax", "sigmoid", "positive", "unconstrained"}
+ACTION_MODES = {"coefficients_only", "hybrid"}
 
 
 def _initial_raw_value(coefficient_mode: str, coefficient_init: float) -> float:
@@ -30,13 +31,17 @@ class HybridActorCritic(nn.Module):
         hidden_dim: int = 64,
         coefficient_mode: str = "softmax",
         coefficient_init: float = 1.0,
+        action_mode: str = "coefficients_only",
     ):
         super().__init__()
         if coefficient_mode not in COEFFICIENT_MODES:
             raise ValueError(f"coefficient_mode must be one of: {sorted(COEFFICIENT_MODES)}")
+        if action_mode not in ACTION_MODES:
+            raise ValueError(f"action_mode must be one of: {sorted(ACTION_MODES)}")
 
         self.num_models = num_models
         self.coefficient_mode = coefficient_mode
+        self.action_mode = action_mode
         self.backbone = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.Tanh(),
@@ -93,14 +98,21 @@ def coefficients_from_action(
 
 def sample_hybrid_action(model: HybridActorCritic, state: torch.Tensor):
     gate_logits, weight_mean, log_std, value = model(state)
-    gate_distribution = torch.distributions.Bernoulli(logits=gate_logits)
     weight_distribution = torch.distributions.Normal(weight_mean, log_std.exp())
-
-    gate_action = gate_distribution.sample()
     raw_weights = weight_distribution.rsample()
-    active, coefficients = coefficients_from_action(gate_action, raw_weights, model.coefficient_mode)
-    log_prob = gate_distribution.log_prob(gate_action).sum() + weight_distribution.log_prob(raw_weights).sum()
-    entropy = gate_distribution.entropy().sum() + weight_distribution.entropy().sum()
+
+    if model.action_mode == "hybrid":
+        gate_distribution = torch.distributions.Bernoulli(logits=gate_logits)
+        gate_action = gate_distribution.sample()
+        active, coefficients = coefficients_from_action(gate_action, raw_weights, model.coefficient_mode)
+        log_prob = gate_distribution.log_prob(gate_action).sum() + weight_distribution.log_prob(raw_weights).sum()
+        entropy = gate_distribution.entropy().sum() + weight_distribution.entropy().sum()
+    else:
+        gate_action = torch.ones_like(raw_weights)
+        active = torch.ones_like(raw_weights)
+        coefficients = transform_coefficients(raw_weights, model.coefficient_mode)
+        log_prob = weight_distribution.log_prob(raw_weights).sum()
+        entropy = weight_distribution.entropy().sum()
     return active, coefficients, gate_action, raw_weights, log_prob, entropy, value
 
 
@@ -111,17 +123,24 @@ def evaluate_hybrid_action(
     raw_weights: torch.Tensor,
 ):
     gate_logits, weight_mean, log_std, values = model(states)
-    gate_distribution = torch.distributions.Bernoulli(logits=gate_logits)
     weight_distribution = torch.distributions.Normal(weight_mean, log_std.exp())
+    log_prob = weight_distribution.log_prob(raw_weights).sum(dim=-1)
+    entropy = weight_distribution.entropy().sum(dim=-1)
 
-    log_prob = gate_distribution.log_prob(gate_actions).sum(dim=-1)
-    log_prob = log_prob + weight_distribution.log_prob(raw_weights).sum(dim=-1)
-    entropy = gate_distribution.entropy().sum(dim=-1) + weight_distribution.entropy().sum(dim=-1)
+    if model.action_mode == "hybrid":
+        gate_distribution = torch.distributions.Bernoulli(logits=gate_logits)
+        log_prob = gate_distribution.log_prob(gate_actions).sum(dim=-1) + log_prob
+        entropy = gate_distribution.entropy().sum(dim=-1) + entropy
     return log_prob, entropy, values
 
 
 @torch.no_grad()
 def deterministic_hybrid_action(model: HybridActorCritic, state: torch.Tensor, gate_threshold: float):
     gate_logits, weight_mean, _, _ = model(state)
-    gate_action = (torch.sigmoid(gate_logits) >= gate_threshold).float()
-    return coefficients_from_action(gate_action, weight_mean, model.coefficient_mode)
+    if model.action_mode == "hybrid":
+        gate_action = (torch.sigmoid(gate_logits) >= gate_threshold).float()
+        return coefficients_from_action(gate_action, weight_mean, model.coefficient_mode)
+
+    active = torch.ones_like(weight_mean)
+    coefficients = transform_coefficients(weight_mean, model.coefficient_mode)
+    return active, coefficients

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+
 import torch
 import torch.nn as nn
 
@@ -7,6 +9,8 @@ try:
     from torch.func import functional_call
 except ImportError:
     from torch.nn.utils.stateless import functional_call
+
+from mmcr.task_vectors import load_state_dict
 
 from .merge import (
     LayeredTaskVectors,
@@ -39,9 +43,12 @@ class RLMMCREnv:
         coefficient_mode: str = "softmax",
         coefficient_init: float = 1.0,
         cache_task_vectors_device: bool = False,
+        merge_granularity: str = "layer",
     ):
         if reward_eval_interval <= 0:
             raise ValueError("reward_eval_interval must be positive.")
+        if merge_granularity not in {"layer", "global"}:
+            raise ValueError("merge_granularity must be either 'layer' or 'global'.")
 
         self.encoder = encoder
         self.heads = nn.ModuleDict(heads)
@@ -57,12 +64,14 @@ class RLMMCREnv:
         self.reward_eval_interval = reward_eval_interval
         self.episode_reward_only = episode_reward_only
         self.coefficient_mode = coefficient_mode
+        self.merge_granularity = merge_granularity
 
         self.num_layers = layered_task_vectors.num_layers
         self.num_models = layered_task_vectors.num_models
         self.layer_names = layered_task_vectors.layer_names
         self.layer_grams = build_layer_gram_matrices(layered_task_vectors)
-        self.layer_similarity_features = [self._pairwise_distance_features(gram) for gram in self.layer_grams]
+        self.layer_geometry_features = [self._layer_geometry_features(gram) for gram in self.layer_grams]
+        self.global_geometry_feature = torch.stack(self.layer_geometry_features).mean(dim=0)
 
         self._pretrained_state_device = {
             key: value.detach().to(device, non_blocking=True)
@@ -91,13 +100,16 @@ class RLMMCREnv:
 
     @property
     def state_dim(self) -> int:
-        return 1 + self.layer_similarity_features[0].numel() + 4 + self.num_models
+        return 7 * self.num_models + 2
 
     def reset(self) -> torch.Tensor:
         self.layer_index = 0
         self.coefficients_by_layer = self._initial_coefficients_by_layer.clone()
-        self.selection_counts = torch.zeros(self.num_models, dtype=torch.float32)
+        self.last_coefficients = self._initial_coefficients_by_layer[0].clone()
         self.last_layer_norm_ratio = torch.tensor(1.0, dtype=torch.float32)
+        self.latest_retention_ratios = self._retention_ratios_from_stats(self._initial_reward_stats)
+        self.latest_eval_mask = torch.ones(self.num_models, dtype=torch.float32)
+        self.steps_since_eval = 0
         self._merged_state_device = dict(self._initial_merged_state_device)
         self.previous_average = self._initial_average
         self.previous_scores = dict(self._initial_scores)
@@ -114,15 +126,29 @@ class RLMMCREnv:
         if tuple(selected.shape) != (self.num_models,) or tuple(coefficients.shape) != (self.num_models,):
             raise ValueError(f"selected and coefficients must have shape ({self.num_models},).")
 
-        layer_name = self.layer_names[self.layer_index]
-        self._apply_layer_coefficients(self.layer_index, coefficients)
-        self.coefficients_by_layer[self.layer_index] = coefficients
-        self.selection_counts += selected
-        self.last_layer_norm_ratio = self._layer_norm_ratio(self.layer_index, coefficients)
+        if self.merge_granularity == "global":
+            layer_name = "global"
+            for layer_index in range(self.num_layers):
+                self._apply_layer_coefficients(layer_index, coefficients)
+            self.coefficients_by_layer[:] = coefficients.unsqueeze(0).expand_as(self.coefficients_by_layer)
+            self.last_coefficients = coefficients.clone()
+            self.last_layer_norm_ratio = torch.stack([
+                self._layer_norm_ratio(layer_index, coefficients)
+                for layer_index in range(self.num_layers)
+            ]).mean()
+            done = True
+            reward, average, scores, objective, reward_stats, reward_evaluated = self._reward_for_step(done)
+            self.layer_index = self.num_layers
+        else:
+            layer_name = self.layer_names[self.layer_index]
+            self._apply_layer_coefficients(self.layer_index, coefficients)
+            self.coefficients_by_layer[self.layer_index] = coefficients
+            self.last_coefficients = coefficients.clone()
+            self.last_layer_norm_ratio = self._layer_norm_ratio(self.layer_index, coefficients)
 
-        done = self.layer_index + 1 == self.num_layers
-        reward, average, scores, objective, reward_stats, reward_evaluated = self._reward_for_step(done)
-        self.layer_index += 1
+            done = self.layer_index + 1 == self.num_layers
+            reward, average, scores, objective, reward_stats, reward_evaluated = self._reward_for_step(done)
+            self.layer_index += 1
 
         info = {
             "layer_name": layer_name,
@@ -138,12 +164,21 @@ class RLMMCREnv:
         return self._state(), float(reward), done, info
 
     @torch.no_grad()
+    def expand_coefficients(self, coefficients: torch.Tensor) -> torch.Tensor:
+        coefficients = coefficients.detach().cpu().float()
+        if coefficients.ndim == 1:
+            coefficients = coefficients.unsqueeze(0)
+        if tuple(coefficients.shape) == (1, self.num_models):
+            return coefficients.expand(self.num_layers, self.num_models).clone()
+        return coefficients
+
+    @torch.no_grad()
     def export_merged_state(self, coefficients_by_layer: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         if coefficients_by_layer is None:
             return {key: value.detach().cpu().clone() for key, value in self._merged_state_device.items()}
         return merge_state_with_layer_coefficients(
             self.layered_task_vectors,
-            coefficients_by_layer,
+            self.expand_coefficients(coefficients_by_layer),
             coefficient_mode=self.coefficient_mode,
         )
 
@@ -162,14 +197,37 @@ class RLMMCREnv:
         self._initial_merged_state_device = dict(self._merged_state_device)
 
     def _state(self) -> torch.Tensor:
-        if self.layer_index >= self.num_layers:
+        if self.merge_granularity == "global":
+            layer_progress = torch.tensor([1.0 if self.layer_index >= self.num_layers else 0.0], dtype=torch.float32)
+            layer_geometry = self.global_geometry_feature if self.layer_index < self.num_layers else torch.zeros(2 * self.num_models, dtype=torch.float32)
+        elif self.layer_index >= self.num_layers:
             layer_progress = torch.tensor([1.0], dtype=torch.float32)
-            layer_similarity = torch.zeros_like(self.layer_similarity_features[0])
+            layer_geometry = torch.zeros(2 * self.num_models, dtype=torch.float32)
         else:
             layer_progress = torch.tensor([(self.layer_index + 1) / max(1, self.num_layers)], dtype=torch.float32)
-            layer_similarity = self.layer_similarity_features[self.layer_index]
-        history = self.selection_counts / max(1, self.num_layers)
-        return torch.cat([layer_progress, layer_similarity, self._merged_model_statistics(), history], dim=0)
+            layer_geometry = self.layer_geometry_features[self.layer_index]
+
+        latest_shortfalls = torch.clamp(1.0 - self.latest_retention_ratios, min=0.0)
+        worst_task = torch.zeros(self.num_models, dtype=torch.float32)
+        worst_task[int(torch.argmin(self.latest_retention_ratios).item())] = 1.0
+        steps_since_eval = torch.tensor(
+            [self.steps_since_eval / max(1, self.reward_eval_interval)],
+            dtype=torch.float32,
+        )
+
+        return torch.cat(
+            [
+                layer_progress,
+                layer_geometry,
+                self._mean_coefficients_so_far(),
+                self.last_coefficients.float(),
+                latest_shortfalls,
+                self.latest_eval_mask,
+                worst_task,
+                steps_since_eval,
+            ],
+            dim=0,
+        )
 
     def _reward_for_step(self, done: bool):
         reward_evaluated = done or (
@@ -180,6 +238,9 @@ class RLMMCREnv:
             average, scores = self._evaluate_current_average()
             objective, reward_stats = self._retention_objective(scores)
             reward = self.step_reward_coef * (objective - self.previous_objective)
+            self.latest_retention_ratios = self._retention_ratios_from_stats(reward_stats)
+            self.latest_eval_mask = torch.ones(self.num_models, dtype=torch.float32)
+            self.steps_since_eval = 0
             self.previous_average = average
             self.previous_scores = scores
             self.previous_objective = objective
@@ -190,32 +251,32 @@ class RLMMCREnv:
             objective = self.previous_objective
             reward_stats = dict(self.previous_reward_stats)
             reward = 0.0
+            self.steps_since_eval += 1
 
         if done:
             reward += self.terminal_bonus * objective
         return reward * self.reward_scale, average, scores, objective, reward_stats, reward_evaluated
 
-    def _pairwise_distance_features(self, gram: torch.Tensor) -> torch.Tensor:
-        distances = []
-        for left in range(self.num_models):
-            for right in range(left + 1, self.num_models):
-                distance_sq = gram[left, left] + gram[right, right] - 2.0 * gram[left, right]
-                distances.append(torch.sqrt(distance_sq.clamp(min=0.0)))
-        features = torch.stack(distances).float() if distances else torch.zeros(1, dtype=torch.float32)
-        return features / features.abs().max().clamp(min=1e-8)
+    def _layer_geometry_features(self, gram: torch.Tensor) -> torch.Tensor:
+        norms = torch.diagonal(gram).clamp(min=0.0).sqrt().float()
+        relative_norms = norms / norms.mean().clamp(min=1e-8)
 
-    def _merged_model_statistics(self) -> torch.Tensor:
+        dot_to_average = gram.mean(dim=1).float()
+        average_norm = gram.mean().clamp(min=0.0).sqrt().float()
+        cos_to_average = dot_to_average / (norms * average_norm).clamp(min=1e-8)
+        return torch.cat([relative_norms, cos_to_average.clamp(min=-1.0, max=1.0)], dim=0)
+
+    def _mean_coefficients_so_far(self) -> torch.Tensor:
         if self.layer_index == 0:
-            return torch.tensor([1.0, 0.0, 1.0, 1.0], dtype=torch.float32)
+            return self._initial_coefficients_by_layer[0].float()
+        return self.coefficients_by_layer[: self.layer_index].float().mean(dim=0)
 
-        ratios = torch.stack([
-            self._layer_norm_ratio(layer_index, self.coefficients_by_layer[layer_index])
-            for layer_index in range(self.layer_index)
-        ]).float()
-        history = self.coefficients_by_layer[: self.layer_index].clamp(min=1e-8)
-        entropy = -(history * history.log()).sum(dim=1)
-        entropy = entropy / torch.log(torch.tensor(float(self.num_models))).clamp(min=1e-8)
-        return torch.stack([ratios.mean(), ratios.std(unbiased=False), self.last_layer_norm_ratio, entropy.mean()])
+    def _retention_ratios_from_stats(self, reward_stats: dict) -> torch.Tensor:
+        ratios = reward_stats.get("retention_ratios", {})
+        return torch.tensor(
+            [float(ratios.get(dataset, 1.0)) for dataset in self.layered_task_vectors.task_names],
+            dtype=torch.float32,
+        )
 
     def _layer_norm_ratio(self, layer_index: int, coefficients: torch.Tensor) -> torch.Tensor:
         gram = self.layer_grams[layer_index]
@@ -233,12 +294,17 @@ class RLMMCREnv:
     @torch.no_grad()
     def _evaluate_source_baseline_scores(self) -> dict[str, float]:
         scores = {}
-        for model_index, dataset in enumerate(self.layered_task_vectors.task_names):
+        for dataset, path in zip(self.layered_task_vectors.task_names, self.layered_task_vectors.finetuned_paths):
+            cpu_state = load_state_dict(path, map_location="cpu")
             source_state = {
                 key: value.to(self.device, non_blocking=True)
-                for key, value in self.layered_task_vectors.finetuned_states[model_index].items()
+                for key, value in cpu_state.items()
             }
             scores[dataset] = self._evaluate_dataset_state(source_state, dataset)
+            del source_state, cpu_state
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
         return scores
 
     @torch.no_grad()
