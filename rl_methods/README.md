@@ -16,7 +16,7 @@ python -m rl_methods.rl_mmcr_PPO_GAE_Actor-Critic.train \
   --reward-batch-size 32 \
   --reward-batches-per-dataset 1 \
   --coefficient-mode positive \
-  --coefficient-init 1.0 \
+  --coefficient-init 0.3 \
   --episode-reward-only \
   --log-every 10 \
   --gpu 0 \
@@ -24,12 +24,14 @@ python -m rl_methods.rl_mmcr_PPO_GAE_Actor-Critic.train \
 ```
 
 The maintained implementation lives in `rl_methods/rl_mmcr_PPO_GAE_Actor-Critic/`.
+Its CLI now uses `--coefficient-mode positive`, so coefficients are non-negative and are not normalized to sum to 1.
 
 
 ## SAC Actor-Critic RL-MMCR
 
-Continuous value-based actor-critic baseline. It uses a Dirichlet actor, so the
-action is directly a valid coefficient vector without binary gates.
+Continuous value-based actor-critic baseline. It uses a positive softplus-normal
+actor, so each task coefficient is non-negative and the per-layer coefficient
+sum is not constrained to 1.
 
 Layer-wise run:
 
@@ -85,7 +87,8 @@ The SAC implementation lives in `rl_methods/rl_mmcr_SAC_Actor_Critic/`.
 
 GRPO-style global coefficient baseline without a value network. Each iteration
 samples a group of global coefficient vectors, evaluates them, computes
-relative advantages, and updates a Dirichlet policy.
+relative advantages, and updates a positive softplus-normal policy. Coefficients
+are constrained to be non-negative and are not normalized to sum to 1.
 
 ```bash
 python -m rl_methods.rl_mmcr_GRPO_RLOO.train \
@@ -108,3 +111,50 @@ python -m rl_methods.rl_mmcr_GRPO_RLOO.train \
 ```
 
 The GRPO/RLOO implementation lives in `rl_methods/rl_mmcr_GRPO_RLOO/`.
+
+## Source Baseline Cache
+
+Use this once to evaluate each source model on the full test split and save the
+accuracies used as retention denominators during RL training:
+
+```bash
+python -m rl_methods.source_baselines \
+  --datasets sun397 stanford_cars resisc45 eurosat svhn gtsrb mnist dtd \
+  --checkpoint-root checkpoints \
+  --data-root data \
+  --batch-size 64 \
+  --num-workers 4 \
+  --gpu 0 \
+  --amp \
+  --output-json results/source_baselines_8datasets_test.json
+```
+
+Then pass the cache to any RL method:
+
+```bash
+--source-baseline-json results/source_baselines_8datasets_test.json
+```
+
+The merged model is still evaluated on the configured reward batches during
+training; this cache only replaces the source-model baseline denominator.
+
+## Activation Similarity Reward
+
+Layer-wise RL methods can add a dense activation reward with:
+
+```bash
+--activation-reward-coef 0.01
+```
+
+When enabled, the environment precomputes source-model activations for each
+layer using the first reward batch of each task. During each layer step it
+compares the current merged model activation with the corresponding source
+model activation by cosine similarity and adds the averaged score to reward:
+
+```text
+activation_reward_l = activation_reward_coef * mean_i cosine(A_merged,l(x_i), A_source_i,l(x_i))
+```
+
+This is only active for layer-wise runs. Use a small coefficient first because
+it is added at every layer step and requires extra forward passes.
+

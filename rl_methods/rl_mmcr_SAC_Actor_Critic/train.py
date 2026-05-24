@@ -255,7 +255,7 @@ def export_results(args, env, agent: SACAgent, best_sample: dict, history: list[
         "num_models": env.num_models,
         "num_layers": env.num_layers,
         "layer_names": env.layer_names,
-        "action_type": "sac_dirichlet_continuous_coefficients",
+        "action_type": "sac_positive_softplus_coefficients",
         "merge_granularity": args.merge_granularity,
         "exported_policy": exported_policy,
         "final_policy": final_policy,
@@ -310,6 +310,9 @@ def main() -> None:
         auto_alpha=args.auto_alpha,
         target_entropy=args.target_entropy,
         min_concentration=args.min_concentration,
+        log_std_min=args.log_std_min,
+        log_std_max=args.log_std_max,
+        initial_coefficient=args.coefficient_init,
         device=device,
     )
     replay = ReplayBuffer(env.state_dim, env.num_models, args.replay_size)

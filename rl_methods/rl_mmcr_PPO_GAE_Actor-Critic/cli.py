@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--reward-batches-per-dataset", type=int, default=1)
     data.add_argument("--top-k-percent", type=float, default=20.0)
     data.add_argument("--no-download", action="store_true")
+    data.add_argument("--source-baseline-json", default=None, help="Optional cached source-model baseline accuracies used as retention denominators.")
 
     model = parser.add_argument_group("model")
     model.add_argument("--arch", default=DEFAULT_ARCH)
@@ -37,10 +38,10 @@ def parse_args() -> argparse.Namespace:
     )
     model.add_argument(
         "--coefficient-mode",
-        choices=["softmax", "sigmoid", "positive", "unconstrained"],
-        default="softmax",
+        choices=["positive"],
+        default="positive",
     )
-    model.add_argument("--coefficient-init", type=float, default=1.0)
+    model.add_argument("--coefficient-init", type=float, default=0.3)
     model.add_argument("--export-policy", choices=["best", "final"], default="best")
 
     train = parser.add_argument_group("training")
@@ -51,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--value-coef", type=float, default=0.5)
     train.add_argument("--terminal-bonus", type=float, default=1.0)
     train.add_argument("--reward-scale", type=float, default=1.0)
+    train.add_argument("--activation-reward-coef", type=float, default=0.0, help="Dense layer-wise reward coefficient for cosine similarity between merged and source-model activations.")
     train.add_argument("--step-reward-coef", type=float, default=0.25)
     train.add_argument("--accuracy-imbalance-coef", type=float, default=0.5)
     train.add_argument("--retention-worst-coef", type=float, default=0.5)
@@ -91,3 +93,7 @@ def validate_args(args: argparse.Namespace) -> None:
     for name, value in positive_ints.items():
         if value <= 0:
             raise ValueError(f"{name} must be positive.")
+    if args.coefficient_init <= 0:
+        raise ValueError("--coefficient-init must be positive.")
+    if args.activation_reward_coef < 0:
+        raise ValueError("--activation-reward-coef must be non-negative.")

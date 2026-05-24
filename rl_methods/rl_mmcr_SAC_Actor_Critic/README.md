@@ -4,15 +4,28 @@ This package implements a continuous value-based actor-critic baseline using SAC
 It reuses the maintained PPO-GAE environment and model-merging code, but replaces
 PPO with off-policy SAC over continuous coefficient vectors.
 
-The actor is a Dirichlet policy, so every action is directly a valid coefficient
-vector on the simplex:
+The actor is a positive softplus-normal policy, so each task coefficient is sampled
+independently and constrained only to be non-negative:
 
 ```text
 coefficients >= 0
-sum(coefficients) = 1
+sum(coefficients) is not constrained
 ```
 
-There is no binary gate in this method.
+There is no binary gate and no per-layer sum-to-one normalization in this method.
+
+Notes:
+
+- `--random-steps` counts environment steps, not episodes. In layer-wise mode,
+  one episode contains one step per merged layer.
+- `--episode-reward-only` uses only the terminal objective as reward. If you
+  want interval rewards, omit that flag and set `--reward-eval-interval`.
+- The default SAC entropy temperature is intentionally small (`--alpha 0.02`)
+  because the positive coefficient space is larger than the old simplex space.
+- The default `--coefficient-mode positive` leaves coefficients unnormalized
+  during merging. The SAC CLI no longer exposes simplex softmax weights.
+- The default `--coefficient-init 0.3` initializes the deterministic actor
+  near task-arithmetic-style scales instead of starting from 1.0 for every task.
 
 ## Layer-wise SAC
 
@@ -21,6 +34,7 @@ python -m rl_methods.rl_mmcr_SAC_Actor_Critic.train \
   --datasets mnist svhn gtsrb eurosat dtd \
   --checkpoint-root checkpoints \
   --data-root data \
+  --source-baseline-json results/source_baselines_8datasets_test.json \
   --output-dir rl_mmcr_SAC_Actor_Critic_runs/layer_interval4_seed2026 \
   --merge-granularity layer \
   --episodes 300 \
@@ -70,3 +84,19 @@ Outputs are saved under `--output-dir`:
 - `results.json`
 - `training_curves.png`
 - `reward_curves.png`
+
+To avoid recomputing source-model retention denominators at startup, first run
+`python -m rl_methods.source_baselines ...` from the parent README and pass the
+result with `--source-baseline-json`.
+
+## Activation Reward
+
+Add dense layer-wise activation guidance with a small coefficient:
+
+```bash
+--activation-reward-coef 0.01
+```
+
+This compares each merged layer activation with the corresponding source-model
+activation using cosine similarity on the first reward batch for each dataset.
+It adds extra forward passes, so expect slower training.

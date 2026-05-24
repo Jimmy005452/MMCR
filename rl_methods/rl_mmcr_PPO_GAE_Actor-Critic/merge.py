@@ -86,6 +86,8 @@ def initial_coefficients(
 
 
 def normalize_coefficients(coefficients: torch.Tensor, coefficient_mode: str) -> torch.Tensor:
+    if coefficient_mode == "positive":
+        return coefficients.clamp(min=0.0)
     if coefficient_mode != "softmax":
         return coefficients
     if coefficients.ndim == 1:
@@ -112,7 +114,7 @@ def build_layer_gram_matrices(layered_task_vectors: LayeredTaskVectors) -> list[
 def merge_state_with_layer_coefficients(
     layered_task_vectors: LayeredTaskVectors,
     coefficients_by_layer: torch.Tensor,
-    coefficient_mode: str = "softmax",
+    coefficient_mode: str = "positive",
 ) -> dict[str, torch.Tensor]:
     expected_shape = (layered_task_vectors.num_layers, layered_task_vectors.num_models)
     coefficients_by_layer = coefficients_by_layer.detach().cpu().float()

@@ -4,6 +4,7 @@ import gc
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     from torch.func import functional_call
@@ -40,10 +41,12 @@ class RLMMCREnv:
         retention_drop_coef: float = 0.5,
         reward_eval_interval: int = 1,
         episode_reward_only: bool = False,
-        coefficient_mode: str = "softmax",
+        coefficient_mode: str = "positive",
         coefficient_init: float = 1.0,
         cache_task_vectors_device: bool = False,
         merge_granularity: str = "layer",
+        source_baseline_scores: dict[str, float] | None = None,
+        activation_reward_coef: float = 0.0,
     ):
         if reward_eval_interval <= 0:
             raise ValueError("reward_eval_interval must be positive.")
@@ -65,6 +68,7 @@ class RLMMCREnv:
         self.episode_reward_only = episode_reward_only
         self.coefficient_mode = coefficient_mode
         self.merge_granularity = merge_granularity
+        self.activation_reward_coef = float(activation_reward_coef)
 
         self.num_layers = layered_task_vectors.num_layers
         self.num_models = layered_task_vectors.num_models
@@ -88,7 +92,18 @@ class RLMMCREnv:
         for head in self.heads.values():
             head.eval().requires_grad_(False)
 
-        self.source_baseline_scores = self._evaluate_source_baseline_scores()
+        self.activation_modules = self._resolve_activation_modules()
+        self._source_activation_refs = (
+            self._precompute_source_activation_refs()
+            if self.activation_reward_coef != 0.0 and self.merge_granularity == "layer"
+            else None
+        )
+
+        self.source_baseline_scores = (
+            self._validate_source_baseline_scores(source_baseline_scores)
+            if source_baseline_scores is not None
+            else self._evaluate_source_baseline_scores()
+        )
         self._initial_coefficients_by_layer = initial_coefficients(
             self.num_layers,
             self.num_models,
@@ -100,16 +115,11 @@ class RLMMCREnv:
 
     @property
     def state_dim(self) -> int:
-        return 7 * self.num_models + 2
+        return 3 * self.num_models + 1
 
     def reset(self) -> torch.Tensor:
         self.layer_index = 0
         self.coefficients_by_layer = self._initial_coefficients_by_layer.clone()
-        self.last_coefficients = self._initial_coefficients_by_layer[0].clone()
-        self.last_layer_norm_ratio = torch.tensor(1.0, dtype=torch.float32)
-        self.latest_retention_ratios = self._retention_ratios_from_stats(self._initial_reward_stats)
-        self.latest_eval_mask = torch.ones(self.num_models, dtype=torch.float32)
-        self.steps_since_eval = 0
         self._merged_state_device = dict(self._initial_merged_state_device)
         self.previous_average = self._initial_average
         self.previous_scores = dict(self._initial_scores)
@@ -131,11 +141,6 @@ class RLMMCREnv:
             for layer_index in range(self.num_layers):
                 self._apply_layer_coefficients(layer_index, coefficients)
             self.coefficients_by_layer[:] = coefficients.unsqueeze(0).expand_as(self.coefficients_by_layer)
-            self.last_coefficients = coefficients.clone()
-            self.last_layer_norm_ratio = torch.stack([
-                self._layer_norm_ratio(layer_index, coefficients)
-                for layer_index in range(self.num_layers)
-            ]).mean()
             done = True
             reward, average, scores, objective, reward_stats, reward_evaluated = self._reward_for_step(done)
             self.layer_index = self.num_layers
@@ -143,12 +148,17 @@ class RLMMCREnv:
             layer_name = self.layer_names[self.layer_index]
             self._apply_layer_coefficients(self.layer_index, coefficients)
             self.coefficients_by_layer[self.layer_index] = coefficients
-            self.last_coefficients = coefficients.clone()
-            self.last_layer_norm_ratio = self._layer_norm_ratio(self.layer_index, coefficients)
 
             done = self.layer_index + 1 == self.num_layers
             reward, average, scores, objective, reward_stats, reward_evaluated = self._reward_for_step(done)
+            activation_score, activation_reward = self._activation_reward_for_layer(self.layer_index)
+            activation_reward *= self.reward_scale
+            reward += activation_reward
             self.layer_index += 1
+
+        if self.merge_granularity == "global":
+            activation_score = None
+            activation_reward = 0.0
 
         info = {
             "layer_name": layer_name,
@@ -157,6 +167,8 @@ class RLMMCREnv:
             "scores": scores,
             "reward_stats": reward_stats,
             "reward_evaluated": reward_evaluated,
+            "activation_score": activation_score,
+            "activation_reward": activation_reward,
             "selected": selected.tolist(),
             "coefficients": coefficients.tolist(),
             "coefficients_by_layer": self.coefficients_by_layer.tolist(),
@@ -207,24 +219,11 @@ class RLMMCREnv:
             layer_progress = torch.tensor([(self.layer_index + 1) / max(1, self.num_layers)], dtype=torch.float32)
             layer_geometry = self.layer_geometry_features[self.layer_index]
 
-        latest_shortfalls = torch.clamp(1.0 - self.latest_retention_ratios, min=0.0)
-        worst_task = torch.zeros(self.num_models, dtype=torch.float32)
-        worst_task[int(torch.argmin(self.latest_retention_ratios).item())] = 1.0
-        steps_since_eval = torch.tensor(
-            [self.steps_since_eval / max(1, self.reward_eval_interval)],
-            dtype=torch.float32,
-        )
-
         return torch.cat(
             [
                 layer_progress,
                 layer_geometry,
                 self._mean_coefficients_so_far(),
-                self.last_coefficients.float(),
-                latest_shortfalls,
-                self.latest_eval_mask,
-                worst_task,
-                steps_since_eval,
             ],
             dim=0,
         )
@@ -237,10 +236,7 @@ class RLMMCREnv:
         if reward_evaluated:
             average, scores = self._evaluate_current_average()
             objective, reward_stats = self._retention_objective(scores)
-            reward = self.step_reward_coef * (objective - self.previous_objective)
-            self.latest_retention_ratios = self._retention_ratios_from_stats(reward_stats)
-            self.latest_eval_mask = torch.ones(self.num_models, dtype=torch.float32)
-            self.steps_since_eval = 0
+            reward = 0.0 if self.episode_reward_only else self.step_reward_coef * (objective - self.previous_objective)
             self.previous_average = average
             self.previous_scores = scores
             self.previous_objective = objective
@@ -251,7 +247,6 @@ class RLMMCREnv:
             objective = self.previous_objective
             reward_stats = dict(self.previous_reward_stats)
             reward = 0.0
-            self.steps_since_eval += 1
 
         if done:
             reward += self.terminal_bonus * objective
@@ -271,12 +266,134 @@ class RLMMCREnv:
             return self._initial_coefficients_by_layer[0].float()
         return self.coefficients_by_layer[: self.layer_index].float().mean(dim=0)
 
-    def _retention_ratios_from_stats(self, reward_stats: dict) -> torch.Tensor:
-        ratios = reward_stats.get("retention_ratios", {})
-        return torch.tensor(
-            [float(ratios.get(dataset, 1.0)) for dataset in self.layered_task_vectors.task_names],
-            dtype=torch.float32,
-        )
+    def _activation_module_name(self, layer_name: str) -> str | None:
+        module_names = set(dict(self.encoder.named_modules()))
+        candidates = []
+        if layer_name == "embeddings":
+            candidates = ["patch_embed", "pos_drop", "patch_drop"]
+        elif layer_name == "norm":
+            candidates = ["norm", "fc_norm"]
+        else:
+            candidates = [layer_name]
+        for candidate in candidates:
+            if candidate in module_names:
+                return candidate
+        return None
+
+    def _resolve_activation_modules(self) -> list[str | None]:
+        modules = [self._activation_module_name(layer_name) for layer_name in self.layer_names]
+        if self.activation_reward_coef != 0.0 and self.merge_granularity == "layer":
+            missing = [layer for layer, module in zip(self.layer_names, modules) if module is None]
+            if missing:
+                print("Activation reward will skip unresolved layer(s): " + ", ".join(missing))
+        return modules
+
+    def _pool_activation(self, activation: torch.Tensor) -> torch.Tensor:
+        if isinstance(activation, (tuple, list)):
+            activation = activation[0]
+        activation = activation.detach().float()
+        if activation.ndim <= 1:
+            return activation.reshape(1, -1)
+        return activation.reshape(activation.shape[0], -1)
+
+    @torch.no_grad()
+    def _capture_layer_activation(
+        self,
+        device_state: dict[str, torch.Tensor],
+        images: torch.Tensor,
+        layer_index: int,
+    ) -> torch.Tensor | None:
+        module_name = self.activation_modules[layer_index]
+        if module_name is None:
+            return None
+        modules = dict(self.encoder.named_modules())
+        module = modules[module_name]
+        captured = {}
+
+        def hook(_module, _inputs, output):
+            captured["activation"] = self._pool_activation(output)
+
+        handle = module.register_forward_hook(hook)
+        try:
+            functional_call(self.encoder, device_state, (images,))
+        finally:
+            handle.remove()
+        return captured.get("activation")
+
+    @torch.no_grad()
+    def _capture_all_layer_activations(
+        self,
+        device_state: dict[str, torch.Tensor],
+        images: torch.Tensor,
+    ) -> list[torch.Tensor | None]:
+        modules = dict(self.encoder.named_modules())
+        captured: dict[int, torch.Tensor] = {}
+        handles = []
+        for layer_index, module_name in enumerate(self.activation_modules):
+            if module_name is None:
+                continue
+
+            def make_hook(index: int):
+                def hook(_module, _inputs, output):
+                    captured[index] = self._pool_activation(output).cpu()
+                return hook
+
+            handles.append(modules[module_name].register_forward_hook(make_hook(layer_index)))
+        try:
+            functional_call(self.encoder, device_state, (images,))
+        finally:
+            for handle in handles:
+                handle.remove()
+        return [captured.get(layer_index) for layer_index in range(self.num_layers)]
+
+    @torch.no_grad()
+    def _precompute_source_activation_refs(self) -> list[list[torch.Tensor | None]]:
+        refs: list[list[torch.Tensor | None]] = [
+            [None for _ in range(self.num_models)]
+            for _ in range(self.num_layers)
+        ]
+        print("Precomputing source activation references for activation reward.")
+        for model_index, (dataset, path) in enumerate(zip(self.layered_task_vectors.task_names, self.layered_task_vectors.finetuned_paths)):
+            cpu_state = load_state_dict(path, map_location="cpu")
+            source_state = {
+                key: value.to(self.device, non_blocking=True)
+                for key, value in cpu_state.items()
+            }
+            images = self._reward_batches_device[dataset][0][0]
+            activations = self._capture_all_layer_activations(source_state, images)
+            for layer_index, activation in enumerate(activations):
+                refs[layer_index][model_index] = activation
+            del source_state, cpu_state, activations
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+        return refs
+
+    @torch.no_grad()
+    def _activation_reward_for_layer(self, layer_index: int) -> tuple[float | None, float]:
+        if self.activation_reward_coef == 0.0 or self._source_activation_refs is None:
+            return None, 0.0
+        similarities = []
+        for model_index, dataset in enumerate(self.layered_task_vectors.task_names):
+            reference = self._source_activation_refs[layer_index][model_index]
+            if reference is None:
+                continue
+            images = self._reward_batches_device[dataset][0][0]
+            merged_activation = self._capture_layer_activation(self._merged_state_device, images, layer_index)
+            if merged_activation is None:
+                continue
+            reference = reference.to(self.device, non_blocking=True)
+            if reference.shape != merged_activation.shape:
+                min_batch = min(reference.shape[0], merged_activation.shape[0])
+                min_dim = min(reference.shape[1], merged_activation.shape[1])
+                reference = reference[:min_batch, :min_dim]
+                merged_activation = merged_activation[:min_batch, :min_dim]
+            similarity = F.cosine_similarity(merged_activation, reference, dim=1).mean()
+            similarities.append(similarity)
+        if not similarities:
+            return None, 0.0
+        score = torch.stack(similarities).mean().item()
+        return float(score), float(self.activation_reward_coef * score)
 
     def _layer_norm_ratio(self, layer_index: int, coefficients: torch.Tensor) -> torch.Tensor:
         gram = self.layer_grams[layer_index]
@@ -290,6 +407,22 @@ class RLMMCREnv:
         if self.coefficient_mode == "softmax" and coefficients.sum().abs().item() == 0:
             return torch.full((self.num_models,), 1.0 / self.num_models, dtype=torch.float32)
         return normalize_coefficients(coefficients, self.coefficient_mode)
+
+
+    def _validate_source_baseline_scores(self, scores: dict[str, float]) -> dict[str, float]:
+        validated = {}
+        missing = []
+        for dataset in self.layered_task_vectors.task_names:
+            if dataset not in scores:
+                missing.append(dataset)
+                continue
+            value = float(scores[dataset])
+            if value <= 0.0:
+                raise ValueError(f"Cached source baseline for {dataset} must be positive, got {value}.")
+            validated[dataset] = value
+        if missing:
+            raise ValueError("Cached source baseline is missing dataset(s): " + ", ".join(missing))
+        return validated
 
     @torch.no_grad()
     def _evaluate_source_baseline_scores(self) -> dict[str, float]:

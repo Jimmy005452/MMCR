@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import torch
 from tqdm import tqdm
@@ -27,6 +28,46 @@ def resolve_source_encoder_path(checkpoint_root: Path, dataset: str) -> Path:
     normalized_path = checkpoint_root / normalize_dataset_key(dataset) / ENCODER_FILE
     return normalized_path if normalized_path.exists() else direct_path
 
+
+
+def load_source_baseline_scores(path: str | None, datasets: list[str]) -> dict[str, float] | None:
+    if path is None:
+        return None
+
+    baseline_path = Path(path)
+    with baseline_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if isinstance(payload.get("source_baseline_scores"), dict):
+        raw_scores = payload["source_baseline_scores"]
+    elif isinstance(payload.get("results"), dict):
+        raw_scores = {
+            dataset: row["acc"]
+            for dataset, row in payload["results"].items()
+            if dataset != "average" and isinstance(row, dict) and "acc" in row
+        }
+    else:
+        raw_scores = {
+            dataset: row["acc"]
+            for dataset, row in payload.items()
+            if dataset != "average" and isinstance(row, dict) and "acc" in row
+        }
+
+    scores = {}
+    missing = []
+    for dataset in datasets:
+        normalized = normalize_dataset_key(dataset)
+        if dataset in raw_scores:
+            scores[dataset] = float(raw_scores[dataset])
+        elif normalized in raw_scores:
+            scores[dataset] = float(raw_scores[normalized])
+        else:
+            missing.append(dataset)
+    if missing:
+        raise ValueError(f"{baseline_path} is missing source baseline dataset(s): {', '.join(missing)}")
+
+    print(f"Loaded source baseline scores from {baseline_path}")
+    return scores
 
 def require_existing(paths: list[Path]) -> None:
     missing = [path for path in paths if not path.exists()]
@@ -71,6 +112,8 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
         for dataset, head_path in zip(args.datasets, head_paths)
     }
 
+    source_baseline_scores = load_source_baseline_scores(args.source_baseline_json, args.datasets)
+
     return RLMMCREnv(
         encoder=build_image_encoder(arch=args.arch, pretrained=False).to(device),
         heads=heads,
@@ -90,6 +133,8 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
         coefficient_init=args.coefficient_init,
         cache_task_vectors_device=args.cache_task_vectors_device,
         merge_granularity=args.merge_granularity,
+        source_baseline_scores=source_baseline_scores,
+        activation_reward_coef=args.activation_reward_coef,
     )
 
 

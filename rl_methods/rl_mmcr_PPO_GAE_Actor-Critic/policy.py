@@ -5,21 +5,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-COEFFICIENT_MODES = {"softmax", "sigmoid", "positive", "unconstrained"}
+COEFFICIENT_MODES = {"positive"}
 ACTION_MODES = {"coefficients_only", "hybrid"}
 
 
 def _initial_raw_value(coefficient_mode: str, coefficient_init: float) -> float:
-    if coefficient_mode == "softmax":
-        return 0.0
-    if coefficient_mode == "sigmoid":
-        value = min(max(coefficient_init, 1e-4), 1.0 - 1e-4)
-        return torch.logit(torch.tensor(value)).item()
     if coefficient_mode == "positive":
         value = max(coefficient_init, 1e-4)
         return torch.log(torch.expm1(torch.tensor(value))).item()
-    if coefficient_mode == "unconstrained":
-        return float(coefficient_init)
     raise ValueError(f"coefficient_mode must be one of: {sorted(COEFFICIENT_MODES)}")
 
 
@@ -29,7 +22,7 @@ class HybridActorCritic(nn.Module):
         state_dim: int,
         num_models: int,
         hidden_dim: int = 64,
-        coefficient_mode: str = "softmax",
+        coefficient_mode: str = "positive",
         coefficient_init: float = 1.0,
         action_mode: str = "coefficients_only",
     ):
@@ -67,14 +60,8 @@ class HybridActorCritic(nn.Module):
 
 
 def transform_coefficients(raw_weights: torch.Tensor, coefficient_mode: str) -> torch.Tensor:
-    if coefficient_mode == "softmax":
-        return F.softmax(raw_weights, dim=-1)
-    if coefficient_mode == "sigmoid":
-        return torch.sigmoid(raw_weights)
     if coefficient_mode == "positive":
         return F.softplus(raw_weights)
-    if coefficient_mode == "unconstrained":
-        return raw_weights
     raise RuntimeError(f"Unsupported coefficient_mode: {coefficient_mode}")
 
 
@@ -87,12 +74,7 @@ def coefficients_from_action(
     if active.sum().item() == 0:
         active = torch.ones_like(active)
 
-    if coefficient_mode == "softmax":
-        masked_weights = raw_weights.masked_fill(active == 0, -1e9)
-        coefficients = F.softmax(masked_weights, dim=0) * active
-        coefficients = coefficients / coefficients.sum().clamp(min=1e-8)
-    else:
-        coefficients = transform_coefficients(raw_weights, coefficient_mode) * active
+    coefficients = transform_coefficients(raw_weights, coefficient_mode) * active
     return active, coefficients
 
 

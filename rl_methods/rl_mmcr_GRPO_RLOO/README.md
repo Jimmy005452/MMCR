@@ -5,13 +5,25 @@ model-merging setup: **global coefficients + group-relative advantages**.
 
 It does not use a value network. For each iteration it samples a group of global
 coefficient vectors, evaluates each one, computes a group-relative advantage,
-and updates a Dirichlet coefficient policy with PPO-style clipping.
+and updates a positive softplus-normal coefficient policy with PPO-style clipping.
+
+Each coefficient is constrained to be non-negative. The coefficient sum is not
+constrained to 1.
 
 Supported advantage modes:
 
 - `rloo`: leave-one-out reward baseline, normalized by group std
 - `zscore`: reward z-score within the group
 - `rank`: rank-based advantage for noisy rewards
+
+Notes:
+
+- GRPO currently supports global coefficients only.
+- The default `--coefficient-mode positive` leaves coefficients unnormalized during merging.
+- `--episode-reward-only` uses only the terminal objective as reward.
+- `--export-policy best` exports the best sampled coefficient vector; use
+  `--export-policy final` when you want to evaluate the deterministic learned
+  policy itself.
 
 ## Run
 

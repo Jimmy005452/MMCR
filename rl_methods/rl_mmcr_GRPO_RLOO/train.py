@@ -10,7 +10,7 @@ from mmcr.evaluation import evaluate_encoder
 from mmcr.utils import build_device, seed_everything, write_json
 
 from .cli import parse_args, validate_args
-from .grpo import DirichletPolicy, compute_advantages, update_policy
+from .grpo import PositiveSoftplusPolicy, compute_advantages, update_policy
 
 ppo_train = importlib.import_module("rl_methods.rl_mmcr_PPO_GAE_Actor-Critic.train")
 plotting = importlib.import_module("rl_methods.rl_mmcr_PPO_GAE_Actor-Critic.plotting")
@@ -55,7 +55,7 @@ def evaluate_action(env, coefficients: torch.Tensor) -> dict:
 
 
 @torch.no_grad()
-def deterministic_policy_result(env, policy: DirichletPolicy) -> dict:
+def deterministic_policy_result(env, policy: PositiveSoftplusPolicy) -> dict:
     state = env.reset().to(env.device)
     coefficients = policy.deterministic(state.unsqueeze(0)).squeeze(0)
     result = evaluate_action(env, coefficients)
@@ -71,10 +71,10 @@ def deterministic_policy_result(env, policy: DirichletPolicy) -> dict:
     }
 
 
-def collect_group(env, policy: DirichletPolicy, group_size: int) -> dict:
+def collect_group(env, policy: PositiveSoftplusPolicy, group_size: int) -> dict:
     base_state = env.reset().to(env.device)
     states = base_state.unsqueeze(0).expand(group_size, -1).contiguous()
-    actions, log_probs, entropies = policy.sample(states)
+    actions, raw_actions, log_probs, entropies, old_mean, old_log_std = policy.sample(states)
 
     results = []
     rewards = []
@@ -90,7 +90,10 @@ def collect_group(env, policy: DirichletPolicy, group_size: int) -> dict:
     return {
         "states": states.detach(),
         "actions": actions.detach(),
+        "raw_actions": raw_actions.detach(),
         "old_log_probs": log_probs.detach(),
+        "old_mean": old_mean.detach(),
+        "old_log_std": old_log_std.detach(),
         "entropies": entropies.detach(),
         "rewards": torch.tensor(rewards, dtype=torch.float32, device=env.device),
         "objectives": objectives,
@@ -116,7 +119,7 @@ def summarize_best(group: dict, best_sample: dict) -> dict:
     return result
 
 
-def train(args, env, policy: DirichletPolicy, optimizer: torch.optim.Optimizer):
+def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Optimizer):
     best_sample = {"objective": float("-inf"), "mean_retention": float("-inf")}
     update_history = []
     episode_history = []
@@ -130,7 +133,10 @@ def train(args, env, policy: DirichletPolicy, optimizer: torch.optim.Optimizer):
             optimizer,
             group["states"],
             group["actions"],
+            group["raw_actions"],
             group["old_log_probs"],
+            group["old_mean"],
+            group["old_log_std"],
             advantages,
             clip_eps=args.clip_eps,
             entropy_coef=args.entropy_coef,
@@ -204,7 +210,7 @@ def train(args, env, policy: DirichletPolicy, optimizer: torch.optim.Optimizer):
     return best_sample, update_history, episode_history
 
 
-def export_results(args, env, policy: DirichletPolicy, best_sample: dict, history: list[dict], episodes: list[dict]):
+def export_results(args, env, policy: PositiveSoftplusPolicy, best_sample: dict, history: list[dict], episodes: list[dict]):
     output_dir = Path(args.output_dir)
     final_policy = deterministic_policy_result(env, policy)
     final_coefficients = torch.tensor(final_policy["coefficients"], dtype=torch.float32)
@@ -243,7 +249,7 @@ def export_results(args, env, policy: DirichletPolicy, best_sample: dict, histor
         "num_models": env.num_models,
         "num_layers": env.num_layers,
         "layer_names": env.layer_names,
-        "action_type": "global_grpo_rloo_dirichlet_coefficients",
+        "action_type": "global_grpo_rloo_positive_softplus_coefficients",
         "merge_granularity": args.merge_granularity,
         "exported_policy": exported_policy,
         "final_policy": final_policy,
@@ -284,11 +290,13 @@ def main() -> None:
     print(f"Using device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""))
 
     env = ppo_train.build_environment(args, device)
-    policy = DirichletPolicy(
+    policy = PositiveSoftplusPolicy(
         env.state_dim,
         env.num_models,
         hidden_dim=args.policy_hidden_dim,
-        min_concentration=args.min_concentration,
+        log_std_min=args.log_std_min,
+        log_std_max=args.log_std_max,
+        initial_coefficient=args.coefficient_init,
     ).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
 

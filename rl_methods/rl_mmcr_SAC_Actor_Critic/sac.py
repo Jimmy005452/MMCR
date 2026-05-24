@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import NamedTuple
 
 import torch
@@ -14,6 +15,11 @@ class TransitionBatch(NamedTuple):
     rewards: torch.Tensor
     next_states: torch.Tensor
     dones: torch.Tensor
+
+
+def inverse_softplus(value: float) -> float:
+    value = max(float(value), 1e-6)
+    return math.log(math.expm1(value))
 
 
 class ReplayBuffer:
@@ -48,34 +54,61 @@ class ReplayBuffer:
         )
 
 
-class DirichletActor(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128, min_concentration: float = 0.05):
+class PositiveSoftplusActor(nn.Module):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 128,
+        log_std_min: float = -5.0,
+        log_std_max: float = 1.0,
+        initial_coefficient: float = 1.0,
+    ):
         super().__init__()
-        self.min_concentration = float(min_concentration)
+        self.action_dim = int(action_dim)
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
         self.backbone = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
-        self.concentration = nn.Linear(hidden_dim, action_dim)
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
+        nn.init.zeros_(self.mean.weight)
+        nn.init.constant_(self.mean.bias, inverse_softplus(initial_coefficient))
+        nn.init.zeros_(self.log_std.weight)
+        nn.init.constant_(self.log_std.bias, -2.0)
 
-    def distribution(self, states: torch.Tensor) -> torch.distributions.Dirichlet:
+    def forward(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = self.backbone(states)
-        concentration = F.softplus(self.concentration(hidden)) + self.min_concentration
-        return torch.distributions.Dirichlet(concentration)
+        mean = torch.nan_to_num(self.mean(hidden), nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        log_std = torch.nan_to_num(
+            self.log_std(hidden),
+            nan=-2.0,
+            posinf=self.log_std_max,
+            neginf=self.log_std_min,
+        ).clamp(self.log_std_min, self.log_std_max)
+        return mean, log_std
 
     def sample(self, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        distribution = self.distribution(states)
-        actions = distribution.rsample()
-        log_probs = distribution.log_prob(actions).unsqueeze(-1)
+        mean, log_std = self(states)
+        std = log_std.exp()
+        raw = mean + std * torch.randn_like(mean)
+        raw = torch.nan_to_num(raw, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
+        actions = F.softplus(raw).clamp(min=0.0, max=10.0)
+        log_two_pi = torch.tensor(math.log(2.0 * math.pi), device=states.device)
+        normal_log_prob = -0.5 * (((raw - mean) / std).pow(2) + 2.0 * log_std + log_two_pi)
+        log_jacobian = F.logsigmoid(raw)
+        log_probs = (normal_log_prob - log_jacobian).sum(dim=-1, keepdim=True)
+        log_probs = torch.nan_to_num(log_probs, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         return actions, log_probs
 
     @torch.no_grad()
     def deterministic(self, states: torch.Tensor) -> torch.Tensor:
-        distribution = self.distribution(states)
-        concentration = distribution.concentration
-        return concentration / concentration.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        mean, _ = self(states)
+        return F.softplus(mean).clamp(min=0.0, max=10.0)
 
 
 class Critic(nn.Module):
@@ -90,7 +123,8 @@ class Critic(nn.Module):
         )
 
     def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([states, actions], dim=-1))
+        values = self.net(torch.cat([states, actions], dim=-1))
+        return torch.nan_to_num(values, nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
 
 
 @dataclass
@@ -121,6 +155,9 @@ class SACAgent:
         auto_alpha: bool,
         target_entropy: float | None,
         min_concentration: float,
+        log_std_min: float,
+        log_std_max: float,
+        initial_coefficient: float,
         device: torch.device,
     ):
         self.device = device
@@ -129,7 +166,14 @@ class SACAgent:
         self.auto_alpha = bool(auto_alpha)
         self.target_entropy = float(target_entropy) if target_entropy is not None else -float(action_dim)
 
-        self.actor = DirichletActor(state_dim, action_dim, actor_hidden_dim, min_concentration).to(device)
+        self.actor = PositiveSoftplusActor(
+            state_dim,
+            action_dim,
+            actor_hidden_dim,
+            log_std_min=log_std_min,
+            log_std_max=log_std_max,
+            initial_coefficient=initial_coefficient,
+        ).to(device)
         self.critic1 = Critic(state_dim, action_dim, critic_hidden_dim).to(device)
         self.critic2 = Critic(state_dim, action_dim, critic_hidden_dim).to(device)
         self.target_critic1 = Critic(state_dim, action_dim, critic_hidden_dim).to(device)
@@ -152,39 +196,57 @@ class SACAgent:
     @torch.no_grad()
     def sample_action(self, state: torch.Tensor, random: bool = False) -> torch.Tensor:
         if random:
-            concentration = torch.ones(self.actor.concentration.out_features, device=self.device)
-            return torch.distributions.Dirichlet(concentration).sample()
+            return torch.empty(self.actor.action_dim, device=self.device).uniform_(0.0, 1.0)
         action, _ = self.actor.sample(state.unsqueeze(0).to(self.device))
-        return action.squeeze(0)
+        return action.squeeze(0).clamp(min=0.0, max=10.0)
 
     @torch.no_grad()
     def deterministic_action(self, state: torch.Tensor) -> torch.Tensor:
-        return self.actor.deterministic(state.unsqueeze(0).to(self.device)).squeeze(0)
+        return self.actor.deterministic(state.unsqueeze(0).to(self.device)).squeeze(0).clamp(min=0.0, max=10.0)
 
     def update(self, replay: ReplayBuffer, batch_size: int) -> SACStats:
         batch = replay.sample(batch_size, self.device)
+        batch = TransitionBatch(
+            batch.states,
+            torch.nan_to_num(batch.actions, nan=0.0, posinf=10.0, neginf=0.0).clamp(min=0.0, max=10.0),
+            torch.nan_to_num(batch.rewards, nan=0.0, posinf=10.0, neginf=-10.0).clamp(min=-10.0, max=10.0),
+            batch.next_states,
+            batch.dones,
+        )
 
         with torch.no_grad():
             next_actions, next_log_probs = self.actor.sample(batch.next_states)
+            next_actions = torch.nan_to_num(next_actions, nan=0.0, posinf=10.0, neginf=0.0).clamp(min=0.0, max=10.0)
+            next_log_probs = torch.nan_to_num(next_log_probs, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
             target_q1 = self.target_critic1(batch.next_states, next_actions)
             target_q2 = self.target_critic2(batch.next_states, next_actions)
             target_q = torch.min(target_q1, target_q2) - self.alpha.detach() * next_log_probs
+            target_q = torch.nan_to_num(target_q, nan=0.0, posinf=10.0, neginf=-10.0).clamp(min=-10.0, max=10.0)
             target = batch.rewards + (1.0 - batch.dones) * self.gamma * target_q
+            target = torch.nan_to_num(target, nan=0.0, posinf=10.0, neginf=-10.0).clamp(min=-10.0, max=10.0)
 
         current_q1 = self.critic1(batch.states, batch.actions)
         current_q2 = self.critic2(batch.states, batch.actions)
         critic_loss = F.mse_loss(current_q1, target) + F.mse_loss(current_q2, target)
+        if not torch.isfinite(critic_loss):
+            return SACStats(0.0, float("nan"), 0.0, float(self.alpha.detach().item()), 0.0, float(target.mean().item()), 0.0)
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
+        nn.utils.clip_grad_norm_(list(self.critic1.parameters()) + list(self.critic2.parameters()), max_norm=5.0)
         self.critic_optimizer.step()
 
         actions, log_probs = self.actor.sample(batch.states)
+        actions = torch.nan_to_num(actions, nan=0.0, posinf=10.0, neginf=0.0).clamp(min=0.0, max=10.0)
+        log_probs = torch.nan_to_num(log_probs, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
         q1 = self.critic1(batch.states, actions)
         q2 = self.critic2(batch.states, actions)
-        q = torch.min(q1, q2)
+        q = torch.nan_to_num(torch.min(q1, q2), nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0)
         actor_loss = (self.alpha.detach() * log_probs - q).mean()
+        if not torch.isfinite(actor_loss):
+            return SACStats(0.0, float(critic_loss.item()), 0.0, float(self.alpha.detach().item()), float(q.mean().item()), float(target.mean().item()), float(log_probs.mean().item()))
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=5.0)
         self.actor_optimizer.step()
 
         if self.auto_alpha:

@@ -18,14 +18,15 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--reward-batches-per-dataset", type=int, default=4)
     data.add_argument("--top-k-percent", type=float, default=20.0)
     data.add_argument("--no-download", action="store_true")
+    data.add_argument("--source-baseline-json", default=None, help="Optional cached source-model baseline accuracies used as retention denominators.")
 
     model = parser.add_argument_group("model")
     model.add_argument("--arch", default=DEFAULT_ARCH)
     model.add_argument("--policy-hidden-dim", type=int, default=128)
     model.add_argument("--critic-hidden-dim", type=int, default=256)
     model.add_argument("--merge-granularity", choices=["layer", "global"], default="layer")
-    model.add_argument("--coefficient-mode", choices=["softmax"], default="softmax")
-    model.add_argument("--coefficient-init", type=float, default=1.0)
+    model.add_argument("--coefficient-mode", choices=["positive"], default="positive")
+    model.add_argument("--coefficient-init", type=float, default=0.3)
     model.add_argument("--export-policy", choices=["best", "final"], default="best")
 
     train = parser.add_argument_group("training")
@@ -36,15 +37,23 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--alpha-lr", type=float, default=3e-4)
     train.add_argument("--batch-size", type=int, default=128)
     train.add_argument("--replay-size", type=int, default=50000)
-    train.add_argument("--random-steps", type=int, default=200)
+    train.add_argument(
+        "--random-steps",
+        type=int,
+        default=200,
+        help="Number of environment steps sampled from independent Uniform(0, 1) positive coefficients before SAC updates use the actor.",
+    )
     train.add_argument("--updates-per-step", type=int, default=1)
     train.add_argument("--tau", type=float, default=0.005)
-    train.add_argument("--alpha", type=float, default=0.2)
+    train.add_argument("--alpha", type=float, default=0.02)
     train.add_argument("--auto-alpha", action="store_true")
     train.add_argument("--target-entropy", type=float, default=None)
-    train.add_argument("--min-concentration", type=float, default=0.05)
+    train.add_argument("--min-concentration", type=float, default=0.05, help="Kept for compatibility with older Dirichlet SAC runs; unused by the positive softplus-normal actor.")
+    train.add_argument("--log-std-min", type=float, default=-5.0)
+    train.add_argument("--log-std-max", type=float, default=1.0)
     train.add_argument("--terminal-bonus", type=float, default=1.0)
     train.add_argument("--reward-scale", type=float, default=1.0)
+    train.add_argument("--activation-reward-coef", type=float, default=0.0, help="Dense layer-wise reward coefficient for cosine similarity between merged and source-model activations.")
     train.add_argument("--step-reward-coef", type=float, default=0.25)
     train.add_argument("--accuracy-imbalance-coef", type=float, default=0.5)
     train.add_argument("--retention-worst-coef", type=float, default=0.5)
@@ -80,7 +89,13 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive.")
     if args.random_steps < 0:
         raise ValueError("--random-steps must be non-negative.")
+    if args.coefficient_mode == "positive" and args.coefficient_init <= 0:
+        raise ValueError("--coefficient-init must be positive when --coefficient-mode positive.")
     if args.tau <= 0 or args.tau > 1:
         raise ValueError("--tau must be in (0, 1].")
     if args.min_concentration <= 0:
         raise ValueError("--min-concentration must be positive.")
+    if args.log_std_min >= args.log_std_max:
+        raise ValueError("--log-std-min must be smaller than --log-std-max.")
+    if args.activation_reward_coef < 0:
+        raise ValueError("--activation-reward-coef must be non-negative.")
