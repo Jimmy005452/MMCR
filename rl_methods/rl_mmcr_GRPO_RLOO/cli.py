@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     model = parser.add_argument_group("model")
     model.add_argument("--arch", default=DEFAULT_ARCH)
     model.add_argument("--policy-hidden-dim", type=int, default=128)
-    model.add_argument("--merge-granularity", choices=["global"], default="global")
+    model.add_argument("--merge-granularity", choices=["global", "layer"], default="global")
     model.add_argument(
         "--state-mode",
         choices=["minimal", "full_coefficients"],

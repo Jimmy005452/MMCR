@@ -32,7 +32,7 @@ def evaluate_action(env, coefficients: torch.Tensor) -> dict:
     selected = torch.ones_like(coefficients)
     next_state, reward, done, info = env.step(selected, coefficients)
     if not done:
-        raise RuntimeError("GRPO_RLOO currently supports only --merge-granularity global.")
+        raise RuntimeError("evaluate_action expects a global one-step environment.")
     expanded = env.expand_coefficients(coefficients.unsqueeze(0))
     return {
         "state": state.detach().cpu(),
@@ -55,10 +55,86 @@ def evaluate_action(env, coefficients: torch.Tensor) -> dict:
 
 
 @torch.no_grad()
-def deterministic_policy_result(env, policy: PositiveSoftplusPolicy) -> dict:
+def evaluate_trajectory(env, policy: PositiveSoftplusPolicy, deterministic: bool = False) -> dict:
     state = env.reset().to(env.device)
-    coefficients = policy.deterministic(state.unsqueeze(0)).squeeze(0)
-    result = evaluate_action(env, coefficients)
+    states = []
+    actions = []
+    raw_actions = []
+    log_probs = []
+    old_mean = []
+    old_log_std = []
+    entropies = []
+    selected_history = []
+    coefficient_history = []
+    rewards = []
+    infos = []
+    done = False
+
+    while not done:
+        states.append(state.detach())
+        if deterministic:
+            coefficients = policy.deterministic(state.unsqueeze(0)).squeeze(0)
+            mean, log_std = policy.distribution_params(state.unsqueeze(0))
+            raw = mean.squeeze(0)
+            log_prob = policy.log_prob(raw.unsqueeze(0), state.unsqueeze(0)).squeeze(0)
+            entropy = torch.zeros((), device=env.device)
+        else:
+            coefficients_batch, raw_batch, log_prob_batch, entropy_batch, mean, log_std = policy.sample(state.unsqueeze(0))
+            coefficients = coefficients_batch.squeeze(0)
+            raw = raw_batch.squeeze(0)
+            log_prob = log_prob_batch.squeeze(0)
+            entropy = entropy_batch.squeeze(0)
+        selected = torch.ones_like(coefficients)
+        next_state, reward, done, info = env.step(selected, coefficients.detach())
+        next_state = next_state.to(env.device)
+
+        actions.append(coefficients.detach())
+        raw_actions.append(raw.detach())
+        log_probs.append(log_prob.detach())
+        old_mean.append(mean.squeeze(0).detach())
+        old_log_std.append(log_std.squeeze(0).detach())
+        entropies.append(entropy.detach())
+        selected_history.append(selected.detach().cpu().tolist())
+        coefficient_history.append(coefficients.detach().cpu().tolist())
+        rewards.append(float(reward))
+        infos.append(info)
+        state = next_state
+
+    expanded = env.expand_coefficients(torch.tensor(coefficient_history, dtype=torch.float32))
+    terminal = infos[-1]
+    return {
+        "states": torch.stack(states),
+        "actions": torch.stack(actions),
+        "raw_actions": torch.stack(raw_actions),
+        "old_log_probs": torch.stack(log_probs),
+        "old_mean": torch.stack(old_mean),
+        "old_log_std": torch.stack(old_log_std),
+        "entropies": torch.stack(entropies),
+        "selected": selected_history,
+        "coefficients": coefficient_history,
+        "expanded_coefficients": expanded.tolist(),
+        "reward": float(sum(rewards)),
+        "average": float(terminal["average"]),
+        "objective": float(terminal["objective"]),
+        "scores": terminal["scores"],
+        "reward_stats": terminal["reward_stats"],
+        "infos": infos,
+        "coefficients_by_layer": coefficients_to_dict(
+            expanded,
+            env.layer_names,
+            env.layered_task_vectors.task_names,
+        ),
+    }
+
+
+@torch.no_grad()
+def deterministic_policy_result(env, policy: PositiveSoftplusPolicy) -> dict:
+    if env.merge_granularity == "global":
+        state = env.reset().to(env.device)
+        coefficients = policy.deterministic(state.unsqueeze(0)).squeeze(0)
+        result = evaluate_action(env, coefficients)
+    else:
+        result = evaluate_trajectory(env, policy, deterministic=True)
     return {
         "selected": result["selected"],
         "coefficients": result["coefficients"],
@@ -71,7 +147,7 @@ def deterministic_policy_result(env, policy: PositiveSoftplusPolicy) -> dict:
     }
 
 
-def collect_group(env, policy: PositiveSoftplusPolicy, group_size: int) -> dict:
+def collect_global_group(env, policy: PositiveSoftplusPolicy, group_size: int) -> dict:
     base_state = env.reset().to(env.device)
     states = base_state.unsqueeze(0).expand(group_size, -1).contiguous()
     actions, raw_actions, log_probs, entropies, old_mean, old_log_std = policy.sample(states)
@@ -102,6 +178,33 @@ def collect_group(env, policy: PositiveSoftplusPolicy, group_size: int) -> dict:
     }
 
 
+def collect_layer_group(env, policy: PositiveSoftplusPolicy, group_size: int) -> dict:
+    trajectories = [evaluate_trajectory(env, policy, deterministic=False) for _ in range(group_size)]
+    rewards = torch.tensor([trajectory["reward"] for trajectory in trajectories], dtype=torch.float32, device=env.device)
+    objectives = [trajectory["objective"] for trajectory in trajectories]
+    retentions = [trajectory["reward_stats"]["mean_retention"] for trajectory in trajectories]
+    return {
+        "states": torch.cat([trajectory["states"] for trajectory in trajectories], dim=0).detach(),
+        "actions": torch.cat([trajectory["actions"] for trajectory in trajectories], dim=0).detach(),
+        "raw_actions": torch.cat([trajectory["raw_actions"] for trajectory in trajectories], dim=0).detach(),
+        "old_log_probs": torch.cat([trajectory["old_log_probs"] for trajectory in trajectories], dim=0).detach(),
+        "old_mean": torch.cat([trajectory["old_mean"] for trajectory in trajectories], dim=0).detach(),
+        "old_log_std": torch.cat([trajectory["old_log_std"] for trajectory in trajectories], dim=0).detach(),
+        "entropies": torch.cat([trajectory["entropies"] for trajectory in trajectories], dim=0).detach(),
+        "trajectory_lengths": [int(trajectory["states"].shape[0]) for trajectory in trajectories],
+        "rewards": rewards,
+        "objectives": objectives,
+        "retentions": retentions,
+        "results": trajectories,
+    }
+
+
+def collect_group(env, policy: PositiveSoftplusPolicy, group_size: int) -> dict:
+    if env.merge_granularity == "global":
+        return collect_global_group(env, policy, group_size)
+    return collect_layer_group(env, policy, group_size)
+
+
 def summarize_best(group: dict, best_sample: dict) -> dict:
     best_index = int(torch.argmax(group["rewards"]).item())
     result = group["results"][best_index]
@@ -127,7 +230,13 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
 
     for iteration in range(args.iterations):
         group = collect_group(env, policy, args.group_size)
-        advantages = compute_advantages(group["rewards"], args.advantage_mode)
+        trajectory_advantages = compute_advantages(group["rewards"], args.advantage_mode)
+        advantages = trajectory_advantages
+        if "trajectory_lengths" in group:
+            advantages = torch.repeat_interleave(
+                trajectory_advantages,
+                torch.tensor(group["trajectory_lengths"], dtype=torch.long, device=env.device),
+            )
         stats = update_policy(
             policy,
             optimizer,
@@ -165,6 +274,7 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
             "group_reward_std": float(group["rewards"].std(unbiased=False).item()),
             "group_objective_mean": float(sum(group["objectives"]) / len(group["objectives"])),
             "group_retention_mean": float(sum(group["retentions"]) / len(group["retentions"])),
+            "trajectory_lengths": group.get("trajectory_lengths", [1 for _ in group["results"]]),
             "sample_average": float(group_best["average"]),
             "sample_retention": float(group_best["reward_stats"]["mean_retention"]),
             "sample_objective": float(group_best["objective"]),
@@ -249,7 +359,7 @@ def export_results(args, env, policy: PositiveSoftplusPolicy, best_sample: dict,
         "num_models": env.num_models,
         "num_layers": env.num_layers,
         "layer_names": env.layer_names,
-        "action_type": "global_grpo_rloo_positive_softplus_coefficients",
+        "action_type": f"{args.merge_granularity}_grpo_rloo_positive_softplus_coefficients",
         "merge_granularity": args.merge_granularity,
         "exported_policy": exported_policy,
         "final_policy": final_policy,
