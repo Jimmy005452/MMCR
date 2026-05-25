@@ -12,7 +12,7 @@ from mmcr.evaluation import evaluate_encoder, resolve_head_path
 from mmcr.models import build_image_encoder
 from mmcr.utils import build_device, seed_everything, write_json
 from .cli import parse_args, validate_args
-from .data import build_reward_batches
+from .data import build_reward_batches, build_synthetic_reward_batches
 from .env import RLMMCREnv
 from .merge import load_layered_ties_task_vectors
 from .plotting import plot_reward_curves, plot_training_curves
@@ -97,16 +97,26 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
         task_names=args.datasets,
         top_k_percent=args.top_k_percent,
     )
-    reward_batches = build_reward_batches(
-        datasets=args.datasets,
-        data_root=args.data_root,
-        arch=args.arch,
-        batch_size=args.reward_batch_size,
-        batches_per_dataset=args.reward_batches_per_dataset,
-        num_workers=args.num_workers,
-        split=args.reward_split,
-        download=not args.no_download,
-    )
+    reward_mode = getattr(args, "reward_mode", "accuracy_retention")
+    if reward_mode in {"synthetic_entropy", "synthetic_proxy"}:
+        reward_batches = build_synthetic_reward_batches(
+            datasets=args.datasets,
+            synthesis_root=getattr(args, "synthesis_root", "synthesis_data/generated"),
+            batch_size=args.reward_batch_size,
+            batches_per_dataset=args.reward_batches_per_dataset,
+            include_rejected=getattr(args, "include_rejected_synthetic", False),
+        )
+    else:
+        reward_batches = build_reward_batches(
+            datasets=args.datasets,
+            data_root=args.data_root,
+            arch=args.arch,
+            batch_size=args.reward_batch_size,
+            batches_per_dataset=args.reward_batches_per_dataset,
+            num_workers=args.num_workers,
+            split=args.reward_split,
+            download=not args.no_download,
+        )
     heads = {
         dataset: load_head(head_path, device=device)
         for dataset, head_path in zip(args.datasets, head_paths)
@@ -136,6 +146,12 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
         source_baseline_scores=source_baseline_scores,
         activation_reward_coef=args.activation_reward_coef,
         state_mode=args.state_mode,
+        reward_mode=reward_mode,
+        kl_weight=getattr(args, "kl_weight", 1.0),
+        agreement_weight=getattr(args, "agreement_weight", 0.5),
+        entropy_weight=getattr(args, "entropy_weight", 0.1),
+        batched_reward_eval=getattr(args, "batched_reward_eval", False),
+        batched_reward_max_samples=getattr(args, "batched_reward_max_samples", 128),
     )
 
 

@@ -82,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--seed", type=int, default=2026)
     runtime.add_argument("--amp", action="store_true")
     runtime.add_argument("--cache-task-vectors-device", action="store_true")
+    runtime.add_argument("--batched-reward-eval", action="store_true", help="Evaluate reward batches from multiple datasets in concatenated encoder forwards.")
+    runtime.add_argument("--batched-reward-max-samples", type=int, default=128, help="Maximum concatenated image count per batched reward encoder forward. Use 0 to concatenate all datasets.")
     runtime.add_argument("--skip-final-eval", action="store_true")
     return parser.parse_args()
 

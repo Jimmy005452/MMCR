@@ -13,12 +13,14 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--checkpoint-root", default="checkpoints")
     data.add_argument("--zeroshot", default=None)
     data.add_argument("--data-root", default="data")
+    data.add_argument("--synthesis-root", default="synthesis_data/generated")
     data.add_argument("--reward-split", choices=["val", "test"], default="val")
     data.add_argument("--reward-batch-size", type=int, default=32)
     data.add_argument("--reward-batches-per-dataset", type=int, default=4)
     data.add_argument("--top-k-percent", type=float, default=20.0)
     data.add_argument("--no-download", action="store_true")
     data.add_argument("--source-baseline-json", default=None, help="Optional cached source-model baseline accuracies used as retention denominators.")
+    data.add_argument("--include-rejected-synthetic", action="store_true", help="Use all synthetic samples instead of accepted_mask-filtered samples.")
 
     model = parser.add_argument_group("model")
     model.add_argument("--arch", default=DEFAULT_ARCH)
@@ -48,6 +50,10 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--log-std-max", type=float, default=1.0)
     train.add_argument("--terminal-bonus", type=float, default=1.0)
     train.add_argument("--reward-scale", type=float, default=1.0)
+    train.add_argument("--reward-mode", choices=["accuracy_retention", "entropy", "synthetic_entropy", "synthetic_proxy"], default="accuracy_retention")
+    train.add_argument("--kl-weight", type=float, default=1.0)
+    train.add_argument("--agreement-weight", type=float, default=0.5)
+    train.add_argument("--entropy-weight", type=float, default=0.1)
     train.add_argument("--activation-reward-coef", type=float, default=0.0, help="Dense layer-wise reward coefficient for cosine similarity between merged and source-model activations.")
     train.add_argument("--step-reward-coef", type=float, default=0.25)
     train.add_argument("--accuracy-imbalance-coef", type=float, default=0.5)
@@ -64,8 +70,25 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--seed", type=int, default=2026)
     runtime.add_argument("--amp", action="store_true")
     runtime.add_argument("--cache-task-vectors-device", action="store_true")
+    runtime.add_argument("--batched-reward-eval", action="store_true", help="Evaluate reward batches from multiple datasets in concatenated encoder forwards.")
+    runtime.add_argument("--batched-reward-max-samples", type=int, default=128, help="Maximum concatenated image count per batched reward encoder forward. Use 0 to concatenate all datasets.")
+    runtime.add_argument("--trajectory-devices", nargs="+", default=None, help="CUDA device ids for multi-GPU layer-wise trajectory rollout, for example: --trajectory-devices 0 1 or --trajectory-devices 0,1.")
     runtime.add_argument("--skip-final-eval", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.trajectory_devices = parse_trajectory_devices(args.trajectory_devices)
+    return args
+
+
+def parse_trajectory_devices(values: list[str] | None) -> list[int]:
+    if not values:
+        return []
+    devices = []
+    for value in values:
+        for item in str(value).split(","):
+            item = item.strip()
+            if item:
+                devices.append(int(item))
+    return devices
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -91,3 +114,13 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--log-std-min must be smaller than --log-std-max.")
     if args.activation_reward_coef < 0:
         raise ValueError("--activation-reward-coef must be non-negative.")
+    if args.kl_weight < 0:
+        raise ValueError("--kl-weight must be non-negative.")
+    if args.agreement_weight < 0:
+        raise ValueError("--agreement-weight must be non-negative.")
+    if args.entropy_weight < 0:
+        raise ValueError("--entropy-weight must be non-negative.")
+    if args.reward_mode != "accuracy_retention" and args.activation_reward_coef != 0:
+        raise ValueError("--activation-reward-coef is only supported with --reward-mode accuracy_retention for now.")
+    if len(args.trajectory_devices) != len(set(args.trajectory_devices)):
+        raise ValueError("--trajectory-devices must not contain duplicate device ids.")

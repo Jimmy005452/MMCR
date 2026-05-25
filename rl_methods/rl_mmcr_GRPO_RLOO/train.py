@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -24,6 +25,46 @@ def format_retention(value: float) -> str:
 def format_scores(scores: dict[str, float], datasets: list[str]) -> str:
     parts = [f"{dataset}={scores[dataset] * 100:.1f}%" for dataset in datasets if dataset in scores]
     return " acc={" + ", ".join(parts) + "}" if parts else ""
+
+
+def same_torch_device(left: torch.device, right: torch.device) -> bool:
+    if left.type != right.type:
+        return False
+    if left.type != "cuda":
+        return True
+    return left.index == right.index
+
+
+def sync_policy_to_device(source: PositiveSoftplusPolicy, target: PositiveSoftplusPolicy, device: torch.device) -> None:
+    state = {key: value.detach().to(device, non_blocking=True) for key, value in source.state_dict().items()}
+    target.load_state_dict(state)
+
+
+def build_trajectory_contexts(args, env, policy: PositiveSoftplusPolicy) -> list[dict]:
+    if env.merge_granularity != "layer" or not args.trajectory_devices:
+        return []
+
+    contexts = []
+    for device_id in args.trajectory_devices:
+        device = build_device(device_id)
+        if same_torch_device(device, env.device):
+            worker_env = env.fork()
+        else:
+            worker_env = ppo_train.build_environment(args, device)
+        worker_policy = PositiveSoftplusPolicy(
+            worker_env.state_dim,
+            worker_env.num_models,
+            hidden_dim=args.policy_hidden_dim,
+            log_std_min=args.log_std_min,
+            log_std_max=args.log_std_max,
+            initial_coefficient=args.coefficient_init,
+        ).to(device)
+        sync_policy_to_device(policy, worker_policy, device)
+        contexts.append({"device": device, "env": worker_env, "policy": worker_policy})
+
+    if env.device.type == "cuda":
+        torch.cuda.set_device(env.device)
+    return contexts
 
 
 @torch.no_grad()
@@ -178,19 +219,22 @@ def collect_global_group(env, policy: PositiveSoftplusPolicy, group_size: int) -
     }
 
 
-def collect_layer_group(env, policy: PositiveSoftplusPolicy, group_size: int) -> dict:
-    trajectories = [evaluate_trajectory(env, policy, deterministic=False) for _ in range(group_size)]
+def _pack_layer_trajectories(env, trajectories: list[dict]) -> dict:
     rewards = torch.tensor([trajectory["reward"] for trajectory in trajectories], dtype=torch.float32, device=env.device)
     objectives = [trajectory["objective"] for trajectory in trajectories]
     retentions = [trajectory["reward_stats"]["mean_retention"] for trajectory in trajectories]
+
+    def to_train_device(name: str) -> torch.Tensor:
+        return torch.cat([trajectory[name].to(env.device, non_blocking=True) for trajectory in trajectories], dim=0).detach()
+
     return {
-        "states": torch.cat([trajectory["states"] for trajectory in trajectories], dim=0).detach(),
-        "actions": torch.cat([trajectory["actions"] for trajectory in trajectories], dim=0).detach(),
-        "raw_actions": torch.cat([trajectory["raw_actions"] for trajectory in trajectories], dim=0).detach(),
-        "old_log_probs": torch.cat([trajectory["old_log_probs"] for trajectory in trajectories], dim=0).detach(),
-        "old_mean": torch.cat([trajectory["old_mean"] for trajectory in trajectories], dim=0).detach(),
-        "old_log_std": torch.cat([trajectory["old_log_std"] for trajectory in trajectories], dim=0).detach(),
-        "entropies": torch.cat([trajectory["entropies"] for trajectory in trajectories], dim=0).detach(),
+        "states": to_train_device("states"),
+        "actions": to_train_device("actions"),
+        "raw_actions": to_train_device("raw_actions"),
+        "old_log_probs": to_train_device("old_log_probs"),
+        "old_mean": to_train_device("old_mean"),
+        "old_log_std": to_train_device("old_log_std"),
+        "entropies": to_train_device("entropies"),
         "trajectory_lengths": [int(trajectory["states"].shape[0]) for trajectory in trajectories],
         "rewards": rewards,
         "objectives": objectives,
@@ -199,10 +243,77 @@ def collect_layer_group(env, policy: PositiveSoftplusPolicy, group_size: int) ->
     }
 
 
-def collect_group(env, policy: PositiveSoftplusPolicy, group_size: int) -> dict:
+def collect_layer_group(
+    env,
+    policy: PositiveSoftplusPolicy,
+    group_size: int,
+    trajectory_contexts: list[dict] | None = None,
+    *,
+    seed: int = 0,
+    iteration: int = 0,
+) -> dict:
+    if not trajectory_contexts:
+        trajectories = [evaluate_trajectory(env, policy, deterministic=False) for _ in range(group_size)]
+        return _pack_layer_trajectories(env, trajectories)
+
+    for context in trajectory_contexts:
+        sync_policy_to_device(policy, context["policy"], context["device"])
+
+    active_contexts = trajectory_contexts[: min(len(trajectory_contexts), group_size)]
+    buckets = [[] for _ in active_contexts]
+    for index in range(group_size):
+        buckets[index % len(active_contexts)].append(index)
+
+    def rollout_bucket(context: dict, indices: list[int]) -> list[tuple[int, dict]]:
+        device = context["device"]
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        items = []
+        for index in indices:
+            rollout_seed = int(seed) + int(iteration) * 100000 + index
+            if device.type == "cuda":
+                torch.cuda.manual_seed(rollout_seed)
+            else:
+                torch.manual_seed(rollout_seed)
+            items.append((index, evaluate_trajectory(context["env"], context["policy"], deterministic=False)))
+        return items
+
+    indexed = []
+    with ThreadPoolExecutor(max_workers=len(active_contexts)) as executor:
+        futures = [
+            executor.submit(rollout_bucket, context, bucket)
+            for context, bucket in zip(active_contexts, buckets)
+            if bucket
+        ]
+        for future in futures:
+            indexed.extend(future.result())
+
+    if env.device.type == "cuda":
+        torch.cuda.set_device(env.device)
+
+    trajectories = [result for _, result in sorted(indexed, key=lambda item: item[0])]
+    return _pack_layer_trajectories(env, trajectories)
+
+
+def collect_group(
+    env,
+    policy: PositiveSoftplusPolicy,
+    group_size: int,
+    trajectory_contexts: list[dict] | None = None,
+    *,
+    seed: int = 0,
+    iteration: int = 0,
+) -> dict:
     if env.merge_granularity == "global":
         return collect_global_group(env, policy, group_size)
-    return collect_layer_group(env, policy, group_size)
+    return collect_layer_group(
+        env,
+        policy,
+        group_size,
+        trajectory_contexts=trajectory_contexts,
+        seed=seed,
+        iteration=iteration,
+    )
 
 
 def summarize_best(group: dict, best_sample: dict) -> dict:
@@ -222,14 +333,21 @@ def summarize_best(group: dict, best_sample: dict) -> dict:
     return result
 
 
-def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Optimizer):
+def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Optimizer, trajectory_contexts: list[dict] | None = None):
     best_sample = {"objective": float("-inf"), "mean_retention": float("-inf")}
     update_history = []
     episode_history = []
     progress = tqdm(total=args.iterations, desc="RL-MMCR-GRPO")
 
     for iteration in range(args.iterations):
-        group = collect_group(env, policy, args.group_size)
+        group = collect_group(
+            env,
+            policy,
+            args.group_size,
+            trajectory_contexts=trajectory_contexts,
+            seed=args.seed,
+            iteration=iteration,
+        )
         trajectory_advantages = compute_advantages(group["rewards"], args.advantage_mode)
         advantages = trajectory_advantages
         if "trajectory_lengths" in group:
@@ -409,8 +527,12 @@ def main() -> None:
         initial_coefficient=args.coefficient_init,
     ).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
+    trajectory_contexts = build_trajectory_contexts(args, env, policy)
+    if trajectory_contexts:
+        devices = ", ".join(str(context["device"]) for context in trajectory_contexts)
+        print(f"Using trajectory devices: {devices}")
 
-    best_sample, history, episode_history = train(args, env, policy, optimizer)
+    best_sample, history, episode_history = train(args, env, policy, optimizer, trajectory_contexts)
     encoder_path, plot_path, reward_plot_path = export_results(args, env, policy, best_sample, history, episode_history)
     print(f"Saved GRPO/RLOO results to {output_dir / 'results.json'}")
     print(f"Saved merged encoder to {encoder_path}")

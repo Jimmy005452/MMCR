@@ -48,6 +48,12 @@ class RLMMCREnv:
         source_baseline_scores: dict[str, float] | None = None,
         activation_reward_coef: float = 0.0,
         state_mode: str = "minimal",
+        reward_mode: str = "accuracy_retention",
+        kl_weight: float = 1.0,
+        agreement_weight: float = 0.5,
+        entropy_weight: float = 0.1,
+        batched_reward_eval: bool = False,
+        batched_reward_max_samples: int = 128,
     ):
         if reward_eval_interval <= 0:
             raise ValueError("reward_eval_interval must be positive.")
@@ -55,6 +61,8 @@ class RLMMCREnv:
             raise ValueError("merge_granularity must be either 'layer' or 'global'.")
         if state_mode not in {"minimal", "full_coefficients"}:
             raise ValueError("state_mode must be either 'minimal' or 'full_coefficients'.")
+        if reward_mode not in {"accuracy_retention", "entropy", "synthetic_entropy", "synthetic_proxy"}:
+            raise ValueError("reward_mode must be one of: accuracy_retention, entropy, synthetic_entropy, synthetic_proxy.")
 
         self.encoder = encoder
         self.heads = nn.ModuleDict(heads)
@@ -73,6 +81,12 @@ class RLMMCREnv:
         self.merge_granularity = merge_granularity
         self.activation_reward_coef = float(activation_reward_coef)
         self.state_mode = state_mode
+        self.reward_mode = reward_mode
+        self.kl_weight = float(kl_weight)
+        self.agreement_weight = float(agreement_weight)
+        self.entropy_weight = float(entropy_weight)
+        self.batched_reward_eval = bool(batched_reward_eval)
+        self.batched_reward_max_samples = int(batched_reward_max_samples)
 
         self.num_layers = layered_task_vectors.num_layers
         self.num_models = layered_task_vectors.num_models
@@ -89,7 +103,7 @@ class RLMMCREnv:
             dataset: [(images.to(device), targets.to(device)) for images, targets in batches]
             for dataset, batches in reward_batches.items()
         }
-        self._task_vectors_device = self._cache_task_vectors(device) if cache_task_vectors_device else None
+        self._task_vectors_stacked_device = self._cache_stacked_task_vectors(device) if cache_task_vectors_device else None
         self._merged_state_device = {key: value.detach().clone() for key, value in self._pretrained_state_device.items()}
 
         self.encoder.eval().requires_grad_(False)
@@ -103,11 +117,18 @@ class RLMMCREnv:
             else None
         )
 
-        self.source_baseline_scores = (
-            self._validate_source_baseline_scores(source_baseline_scores)
-            if source_baseline_scores is not None
-            else self._evaluate_source_baseline_scores()
-        )
+        if self.reward_mode == "accuracy_retention":
+            self.source_baseline_scores = (
+                self._validate_source_baseline_scores(source_baseline_scores)
+                if source_baseline_scores is not None
+                else self._evaluate_source_baseline_scores()
+            )
+        else:
+            self.source_baseline_scores = (
+                self._validate_source_baseline_scores(source_baseline_scores)
+                if source_baseline_scores is not None
+                else {}
+            )
         self._initial_coefficients_by_layer = initial_coefficients(
             self.num_layers,
             self.num_models,
@@ -134,6 +155,13 @@ class RLMMCREnv:
         self.previous_objective = self._initial_objective
         self.previous_reward_stats = dict(self._initial_reward_stats)
         return self._state()
+
+    def fork(self) -> "RLMMCREnv":
+        """Create a lightweight rollout copy with independent mutable episode state."""
+        clone = object.__new__(type(self))
+        clone.__dict__ = self.__dict__.copy()
+        clone.reset()
+        return clone
 
     def step(self, selected: torch.Tensor, coefficients: torch.Tensor):
         if self.layer_index >= self.num_layers:
@@ -208,12 +236,21 @@ class RLMMCREnv:
             for task_vector in self.layered_task_vectors.task_vectors
         ]
 
+    def _cache_stacked_task_vectors(self, device: torch.device) -> dict[str, torch.Tensor]:
+        stacked = {}
+        for key in self.layered_task_vectors.task_vectors[0]:
+            stacked[key] = torch.stack([
+                task_vector[key].detach().to(device, non_blocking=True)
+                for task_vector in self.layered_task_vectors.task_vectors
+            ], dim=0)
+        return stacked
+
     @torch.no_grad()
     def _cache_initial_state(self) -> None:
         for layer_index, coefficients in enumerate(self._initial_coefficients_by_layer):
             self._apply_layer_coefficients(layer_index, coefficients)
         self._initial_average, self._initial_scores = self._evaluate_current_average()
-        self._initial_objective, self._initial_reward_stats = self._retention_objective(self._initial_scores)
+        self._initial_objective, self._initial_reward_stats = self._objective(self._initial_scores)
         self._initial_merged_state_device = dict(self._merged_state_device)
 
     def _state(self) -> torch.Tensor:
@@ -254,7 +291,7 @@ class RLMMCREnv:
         )
         if reward_evaluated:
             average, scores = self._evaluate_current_average()
-            objective, reward_stats = self._retention_objective(scores)
+            objective, reward_stats = self._objective(scores)
             reward = 0.0 if self.episode_reward_only else self.step_reward_coef * (objective - self.previous_objective)
             self.previous_average = average
             self.previous_scores = scores
@@ -461,14 +498,114 @@ class RLMMCREnv:
 
     @torch.no_grad()
     def _evaluate_current_average(self) -> tuple[float, dict[str, float]]:
-        scores = {
-            dataset: self._evaluate_dataset_state(self._merged_state_device, dataset)
-            for dataset in self._reward_batches_device
-        }
+        if self.batched_reward_eval:
+            scores = self._evaluate_current_scores_batched(self._merged_state_device)
+        else:
+            scores = {
+                dataset: self._evaluate_dataset_score(self._merged_state_device, dataset)
+                for dataset in self._reward_batches_device
+            }
         return sum(scores.values()) / len(scores), scores
 
     @torch.no_grad()
-    def _evaluate_dataset_state(self, device_state: dict[str, torch.Tensor], dataset: str) -> float:
+    def _evaluate_current_scores_batched(self, device_state: dict[str, torch.Tensor]) -> dict[str, float]:
+        accum = {
+            dataset: {"correct": 0.0, "kl": 0.0, "agreement": 0.0, "entropy": 0.0, "total": 0}
+            for dataset in self._reward_batches_device
+        }
+        autocast_enabled = self.amp and self.device.type == "cuda"
+        max_batches = max(len(batches) for batches in self._reward_batches_device.values())
+
+        for batch_index in range(max_batches):
+            items = []
+            for dataset, batches in self._reward_batches_device.items():
+                if batch_index < len(batches):
+                    images, target_or_teacher = batches[batch_index]
+                    items.append((dataset, images, target_or_teacher))
+            if not items:
+                continue
+
+            chunks = []
+            current = []
+            current_samples = 0
+            max_samples = self.batched_reward_max_samples if self.batched_reward_max_samples > 0 else sum(int(item[1].shape[0]) for item in items)
+            for item in items:
+                item_samples = int(item[1].shape[0])
+                if current and current_samples + item_samples > max_samples:
+                    chunks.append(current)
+                    current = []
+                    current_samples = 0
+                current.append(item)
+                current_samples += item_samples
+            if current:
+                chunks.append(current)
+
+            for chunk in chunks:
+                images_all = torch.cat([item[1] for item in chunk], dim=0)
+                with torch.autocast(device_type=self.device.type, enabled=autocast_enabled):
+                    features_all = functional_call(self.encoder, device_state, (images_all,))
+
+                offset = 0
+                for dataset, images, target_or_teacher in chunk:
+                    count = int(images.shape[0])
+                    features = features_all[offset : offset + count]
+                    offset += count
+                    with torch.autocast(device_type=self.device.type, enabled=autocast_enabled):
+                        logits = self.heads[dataset](features)
+
+                    row = accum[dataset]
+                    if self.reward_mode == "accuracy_retention":
+                        targets = target_or_teacher
+                        row["correct"] += float((logits.argmax(dim=1) == targets).sum().item())
+                    elif self.reward_mode in {"entropy", "synthetic_entropy"}:
+                        row["entropy"] += float(self._entropy_from_logits(logits).sum().item())
+                    elif self.reward_mode == "synthetic_proxy":
+                        teacher_logits = target_or_teacher.to(logits.device, non_blocking=True)
+                        teacher_probs = F.softmax(teacher_logits, dim=-1)
+                        per_sample_kl = F.kl_div(
+                            F.log_softmax(logits, dim=-1),
+                            teacher_probs,
+                            reduction="none",
+                        ).sum(dim=-1)
+                        row["kl"] += float(per_sample_kl.sum().item())
+                        row["agreement"] += float((logits.argmax(dim=-1) == teacher_logits.argmax(dim=-1)).float().sum().item())
+                        row["entropy"] += float(self._entropy_from_logits(logits).sum().item())
+                    else:
+                        raise RuntimeError(f"Unknown reward_mode: {self.reward_mode}")
+                    row["total"] += count
+
+        scores = {}
+        for dataset, row in accum.items():
+            total = max(int(row["total"]), 1)
+            if self.reward_mode == "accuracy_retention":
+                scores[dataset] = row["correct"] / total
+            elif self.reward_mode in {"entropy", "synthetic_entropy"}:
+                scores[dataset] = -row["entropy"] / total
+            elif self.reward_mode == "synthetic_proxy":
+                mean_kl = row["kl"] / total
+                mean_agreement = row["agreement"] / total
+                mean_entropy = row["entropy"] / total
+                scores[dataset] = -self.kl_weight * mean_kl + self.agreement_weight * mean_agreement - self.entropy_weight * mean_entropy
+        return scores
+
+    @staticmethod
+    def _entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+        return -(probs * log_probs).sum(dim=-1)
+
+    @torch.no_grad()
+    def _evaluate_dataset_score(self, device_state: dict[str, torch.Tensor], dataset: str) -> float:
+        if self.reward_mode == "accuracy_retention":
+            return self._evaluate_dataset_accuracy(device_state, dataset)
+        if self.reward_mode in {"entropy", "synthetic_entropy"}:
+            return self._evaluate_dataset_neg_entropy(device_state, dataset)
+        if self.reward_mode == "synthetic_proxy":
+            return self._evaluate_dataset_synthetic_proxy(device_state, dataset)
+        raise RuntimeError(f"Unknown reward_mode: {self.reward_mode}")
+
+    @torch.no_grad()
+    def _evaluate_dataset_accuracy(self, device_state: dict[str, torch.Tensor], dataset: str) -> float:
         correct = 0
         total = 0
         head = self.heads[dataset]
@@ -483,20 +620,119 @@ class RLMMCREnv:
         return correct / max(total, 1)
 
     @torch.no_grad()
+    def _evaluate_dataset_neg_entropy(self, device_state: dict[str, torch.Tensor], dataset: str) -> float:
+        total_entropy = 0.0
+        total = 0
+        head = self.heads[dataset]
+        autocast_enabled = self.amp and self.device.type == "cuda"
+
+        for images, _targets in self._reward_batches_device[dataset]:
+            with torch.autocast(device_type=self.device.type, enabled=autocast_enabled):
+                features = functional_call(self.encoder, device_state, (images,))
+                logits = head(features)
+            entropy = self._entropy_from_logits(logits)
+            total_entropy += float(entropy.sum().item())
+            total += int(images.shape[0])
+        return -total_entropy / max(total, 1)
+
+    @torch.no_grad()
+    def _evaluate_dataset_synthetic_proxy(self, device_state: dict[str, torch.Tensor], dataset: str) -> float:
+        total_kl = 0.0
+        total_agreement = 0.0
+        total_entropy = 0.0
+        total = 0
+        head = self.heads[dataset]
+        autocast_enabled = self.amp and self.device.type == "cuda"
+
+        for images, teacher_logits in self._reward_batches_device[dataset]:
+            with torch.autocast(device_type=self.device.type, enabled=autocast_enabled):
+                features = functional_call(self.encoder, device_state, (images,))
+                logits = head(features)
+            teacher_logits = teacher_logits.to(logits.device, non_blocking=True)
+            teacher_probs = F.softmax(teacher_logits, dim=-1)
+            per_sample_kl = F.kl_div(
+                F.log_softmax(logits, dim=-1),
+                teacher_probs,
+                reduction="none",
+            ).sum(dim=-1)
+            agreement = (logits.argmax(dim=-1) == teacher_logits.argmax(dim=-1)).float()
+            entropy = self._entropy_from_logits(logits)
+            count = int(images.shape[0])
+            total_kl += float(per_sample_kl.sum().item())
+            total_agreement += float(agreement.sum().item())
+            total_entropy += float(entropy.sum().item())
+            total += count
+
+        total = max(total, 1)
+        mean_kl = total_kl / total
+        mean_agreement = total_agreement / total
+        mean_entropy = total_entropy / total
+        return -self.kl_weight * mean_kl + self.agreement_weight * mean_agreement - self.entropy_weight * mean_entropy
+
+    # Backward-compatible alias used by source-baseline evaluation.
+    def _evaluate_dataset_state(self, device_state: dict[str, torch.Tensor], dataset: str) -> float:
+        return self._evaluate_dataset_accuracy(device_state, dataset)
+
+    @torch.no_grad()
     def _apply_layer_coefficients(self, layer_index: int, coefficients: torch.Tensor) -> None:
         layer_name = self.layer_names[layer_index]
         coefficients = self._prepare_coefficients(coefficients)
+        device_coefficients = coefficients.to(self.device, non_blocking=True)
         for key in self.layered_task_vectors.layer_to_keys[layer_name]:
             base_value = self._pretrained_state_device[key]
-            merged_value = base_value.float()
-            for model_index, task_vector in enumerate(self.layered_task_vectors.task_vectors):
-                task_value = (
-                    task_vector[key].to(self.device, non_blocking=True)
-                    if self._task_vectors_device is None
-                    else self._task_vectors_device[model_index][key]
-                )
-                merged_value = merged_value + float(coefficients[model_index].item()) * task_value.float()
+            if self._task_vectors_stacked_device is not None:
+                stacked = self._task_vectors_stacked_device[key].float()
+                view_shape = (self.num_models,) + (1,) * (stacked.ndim - 1)
+                merged_delta = (device_coefficients.view(view_shape) * stacked).sum(dim=0)
+                merged_value = base_value.float() + merged_delta
+            else:
+                merged_value = base_value.float()
+                for model_index, task_vector in enumerate(self.layered_task_vectors.task_vectors):
+                    task_value = task_vector[key].to(self.device, non_blocking=True)
+                    merged_value = merged_value + float(coefficients[model_index].item()) * task_value.float()
             self._merged_state_device[key] = merged_value.to(dtype=base_value.dtype)
+
+    def _objective(self, scores: dict[str, float]) -> tuple[float, dict]:
+        if self.reward_mode == "accuracy_retention":
+            return self._retention_objective(scores)
+        return self._proxy_objective(scores)
+
+    def _proxy_objective(self, scores: dict[str, float]) -> tuple[float, dict]:
+        values = torch.tensor(list(scores.values()), dtype=torch.float32)
+        mean_score = values.mean()
+        std_score = values.std(unbiased=False)
+        worst_score = values.min()
+        objective = mean_score - self.accuracy_imbalance_coef * std_score
+        return float(objective.item()), {
+            "reward_mode": self.reward_mode,
+            "proxy_scores": dict(scores),
+            "mean_proxy_score": float(mean_score.item()),
+            "std_proxy_score": float(std_score.item()),
+            "worst_proxy_score": float(worst_score.item()),
+            "best_proxy_score": float(values.max().item()),
+            "proxy_gap": float((values.max() - values.min()).item()),
+            "kl_weight": float(self.kl_weight),
+            "agreement_weight": float(self.agreement_weight),
+            "entropy_weight": float(self.entropy_weight),
+            "accuracy_imbalance_coef": float(self.accuracy_imbalance_coef),
+            "objective": float(objective.item()),
+            # Compatibility fields used by existing GRPO/SAC/PPO logging and plotting.
+            "mean_accuracy": float(mean_score.item()),
+            "std_accuracy": float(std_score.item()),
+            "worst_accuracy": float(worst_score.item()),
+            "best_accuracy": float(values.max().item()),
+            "accuracy_gap": float((values.max() - values.min()).item()),
+            "source_baseline_scores": dict(self.source_baseline_scores),
+            "retention_ratios": {dataset: float(score) for dataset, score in scores.items()},
+            "relative_improvements": {dataset: float(score) for dataset, score in scores.items()},
+            "mean_retention": float(mean_score.item()),
+            "std_retention": float(std_score.item()),
+            "worst_retention": float(worst_score.item()),
+            "best_retention": float(values.max().item()),
+            "retention_shortfall": 0.0,
+            "retention_worst_coef": float(self.retention_worst_coef),
+            "retention_drop_coef": float(self.retention_drop_coef),
+        }
 
     def _retention_objective(self, scores: dict[str, float]) -> tuple[float, dict]:
         values = torch.tensor(list(scores.values()), dtype=torch.float32)
