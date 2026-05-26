@@ -99,6 +99,9 @@ class RLMMCREnv:
             key: value.detach().to(device, non_blocking=True)
             for key, value in layered_task_vectors.pretrained_state.items()
         }
+        self.reward_sampling_mode = getattr(reward_batches, "sampling_mode", "sequential")
+        self.reward_batches_per_eval = getattr(reward_batches, "batches_per_eval", None)
+        self._reward_eval_counter = 0
         self._reward_batches_device = {
             dataset: [(images.to(device), targets.to(device)) for images, targets in batches]
             for dataset, batches in reward_batches.items()
@@ -155,6 +158,9 @@ class RLMMCREnv:
         self.previous_objective = self._initial_objective
         self.previous_reward_stats = dict(self._initial_reward_stats)
         return self._state()
+
+    def set_reward_pool_position(self, position: int) -> None:
+        self._reward_eval_counter = max(0, int(position))
 
     def fork(self) -> "RLMMCREnv":
         """Create a lightweight rollout copy with independent mutable episode state."""
@@ -496,29 +502,48 @@ class RLMMCREnv:
             gc.collect()
         return scores
 
+    def _active_reward_batches_device(self) -> dict[str, list[tuple[torch.Tensor, torch.Tensor]]]:
+        if self.reward_sampling_mode != "stratified_pool" or not self.reward_batches_per_eval:
+            return self._reward_batches_device
+        active = {}
+        window = max(1, int(self.reward_batches_per_eval))
+        for dataset, batches in self._reward_batches_device.items():
+            if len(batches) <= window:
+                active[dataset] = batches
+                continue
+            start = (self._reward_eval_counter * window) % len(batches)
+            active[dataset] = [batches[(start + offset) % len(batches)] for offset in range(window)]
+        return active
+
+    def _advance_reward_batches(self) -> None:
+        if self.reward_sampling_mode == "stratified_pool" and self.reward_batches_per_eval:
+            self._reward_eval_counter += 1
+
     @torch.no_grad()
     def _evaluate_current_average(self) -> tuple[float, dict[str, float]]:
+        active_batches = self._active_reward_batches_device()
         if self.batched_reward_eval:
-            scores = self._evaluate_current_scores_batched(self._merged_state_device)
+            scores = self._evaluate_current_scores_batched(self._merged_state_device, active_batches)
         else:
             scores = {
-                dataset: self._evaluate_dataset_score(self._merged_state_device, dataset)
-                for dataset in self._reward_batches_device
+                dataset: self._evaluate_dataset_score(self._merged_state_device, dataset, batches)
+                for dataset, batches in active_batches.items()
             }
+        self._advance_reward_batches()
         return sum(scores.values()) / len(scores), scores
 
     @torch.no_grad()
-    def _evaluate_current_scores_batched(self, device_state: dict[str, torch.Tensor]) -> dict[str, float]:
+    def _evaluate_current_scores_batched(self, device_state: dict[str, torch.Tensor], reward_batches: dict[str, list[tuple[torch.Tensor, torch.Tensor]]]) -> dict[str, float]:
         accum = {
             dataset: {"correct": 0.0, "kl": 0.0, "agreement": 0.0, "entropy": 0.0, "total": 0}
-            for dataset in self._reward_batches_device
+            for dataset in reward_batches
         }
         autocast_enabled = self.amp and self.device.type == "cuda"
-        max_batches = max(len(batches) for batches in self._reward_batches_device.values())
+        max_batches = max(len(batches) for batches in reward_batches.values())
 
         for batch_index in range(max_batches):
             items = []
-            for dataset, batches in self._reward_batches_device.items():
+            for dataset, batches in reward_batches.items():
                 if batch_index < len(batches):
                     images, target_or_teacher = batches[batch_index]
                     items.append((dataset, images, target_or_teacher))
@@ -595,23 +620,24 @@ class RLMMCREnv:
         return -(probs * log_probs).sum(dim=-1)
 
     @torch.no_grad()
-    def _evaluate_dataset_score(self, device_state: dict[str, torch.Tensor], dataset: str) -> float:
+    def _evaluate_dataset_score(self, device_state: dict[str, torch.Tensor], dataset: str, batches: list[tuple[torch.Tensor, torch.Tensor]] | None = None) -> float:
         if self.reward_mode == "accuracy_retention":
-            return self._evaluate_dataset_accuracy(device_state, dataset)
+            return self._evaluate_dataset_accuracy(device_state, dataset, batches)
         if self.reward_mode in {"entropy", "synthetic_entropy"}:
-            return self._evaluate_dataset_neg_entropy(device_state, dataset)
+            return self._evaluate_dataset_neg_entropy(device_state, dataset, batches)
         if self.reward_mode == "synthetic_proxy":
-            return self._evaluate_dataset_synthetic_proxy(device_state, dataset)
+            return self._evaluate_dataset_synthetic_proxy(device_state, dataset, batches)
         raise RuntimeError(f"Unknown reward_mode: {self.reward_mode}")
 
     @torch.no_grad()
-    def _evaluate_dataset_accuracy(self, device_state: dict[str, torch.Tensor], dataset: str) -> float:
+    def _evaluate_dataset_accuracy(self, device_state: dict[str, torch.Tensor], dataset: str, batches: list[tuple[torch.Tensor, torch.Tensor]] | None = None) -> float:
         correct = 0
         total = 0
         head = self.heads[dataset]
         autocast_enabled = self.amp and self.device.type == "cuda"
 
-        for images, targets in self._reward_batches_device[dataset]:
+        batches = self._reward_batches_device[dataset] if batches is None else batches
+        for images, targets in batches:
             with torch.autocast(device_type=self.device.type, enabled=autocast_enabled):
                 features = functional_call(self.encoder, device_state, (images,))
                 logits = head(features)
@@ -620,13 +646,14 @@ class RLMMCREnv:
         return correct / max(total, 1)
 
     @torch.no_grad()
-    def _evaluate_dataset_neg_entropy(self, device_state: dict[str, torch.Tensor], dataset: str) -> float:
+    def _evaluate_dataset_neg_entropy(self, device_state: dict[str, torch.Tensor], dataset: str, batches: list[tuple[torch.Tensor, torch.Tensor]] | None = None) -> float:
         total_entropy = 0.0
         total = 0
         head = self.heads[dataset]
         autocast_enabled = self.amp and self.device.type == "cuda"
 
-        for images, _targets in self._reward_batches_device[dataset]:
+        batches = self._reward_batches_device[dataset] if batches is None else batches
+        for images, _targets in batches:
             with torch.autocast(device_type=self.device.type, enabled=autocast_enabled):
                 features = functional_call(self.encoder, device_state, (images,))
                 logits = head(features)
@@ -636,7 +663,7 @@ class RLMMCREnv:
         return -total_entropy / max(total, 1)
 
     @torch.no_grad()
-    def _evaluate_dataset_synthetic_proxy(self, device_state: dict[str, torch.Tensor], dataset: str) -> float:
+    def _evaluate_dataset_synthetic_proxy(self, device_state: dict[str, torch.Tensor], dataset: str, batches: list[tuple[torch.Tensor, torch.Tensor]] | None = None) -> float:
         total_kl = 0.0
         total_agreement = 0.0
         total_entropy = 0.0
@@ -644,7 +671,8 @@ class RLMMCREnv:
         head = self.heads[dataset]
         autocast_enabled = self.amp and self.device.type == "cuda"
 
-        for images, teacher_logits in self._reward_batches_device[dataset]:
+        batches = self._reward_batches_device[dataset] if batches is None else batches
+        for images, teacher_logits in batches:
             with torch.autocast(device_type=self.device.type, enabled=autocast_enabled):
                 features = functional_call(self.encoder, device_state, (images,))
                 logits = head(features)

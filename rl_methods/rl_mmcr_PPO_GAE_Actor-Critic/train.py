@@ -116,6 +116,9 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
             num_workers=args.num_workers,
             split=args.reward_split,
             download=not args.no_download,
+            sampling_mode=getattr(args, "reward_sampling_mode", "sequential"),
+            reward_pool_size=getattr(args, "reward_pool_size", 0),
+            seed=getattr(args, "seed", 0),
         )
     heads = {
         dataset: load_head(head_path, device=device)

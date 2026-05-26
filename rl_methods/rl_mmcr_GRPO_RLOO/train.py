@@ -188,6 +188,95 @@ def deterministic_policy_result(env, policy: PositiveSoftplusPolicy) -> dict:
     }
 
 
+def fixed_selection_position(args) -> int:
+    return int(getattr(args, "selection_reward_pool_position", -1))
+
+
+def with_reward_pool_position(env, position: int, fn):
+    if position < 0 or not hasattr(env, "set_reward_pool_position"):
+        return fn()
+    previous = getattr(env, "_reward_eval_counter", None)
+    env.set_reward_pool_position(position)
+    try:
+        return fn()
+    finally:
+        if previous is not None:
+            env.set_reward_pool_position(previous)
+
+
+@torch.no_grad()
+def evaluate_coefficients(env, coefficients_by_layer) -> dict:
+    coefficients = torch.tensor(coefficients_by_layer, dtype=torch.float32, device=env.device)
+    state = env.reset().to(env.device)
+    selected_history = []
+    coefficient_history = []
+    rewards = []
+    infos = []
+
+    if env.merge_granularity == "global":
+        if coefficients.ndim == 2:
+            coefficients = coefficients[0]
+        selected = torch.ones_like(coefficients)
+        next_state, reward, done, info = env.step(selected, coefficients.detach())
+        if not done:
+            raise RuntimeError("Global coefficient evaluation did not terminate in one step.")
+        selected_history.append(selected.detach().cpu().tolist())
+        coefficient_history.append(coefficients.detach().cpu().tolist())
+        rewards.append(float(reward))
+        infos.append(info)
+    else:
+        coefficients = env.expand_coefficients(coefficients.detach().cpu()).to(env.device)
+        done = False
+        for layer_coefficients in coefficients:
+            selected = torch.ones_like(layer_coefficients)
+            next_state, reward, done, info = env.step(selected, layer_coefficients.detach())
+            selected_history.append(selected.detach().cpu().tolist())
+            coefficient_history.append(layer_coefficients.detach().cpu().tolist())
+            rewards.append(float(reward))
+            infos.append(info)
+            state = next_state.to(env.device)
+        if not done:
+            raise RuntimeError("Layer coefficient evaluation finished before the environment terminated.")
+
+    expanded = env.expand_coefficients(torch.tensor(coefficient_history, dtype=torch.float32))
+    terminal = infos[-1]
+    return {
+        "state": state.detach().cpu(),
+        "selected": selected_history,
+        "coefficients": coefficient_history,
+        "expanded_coefficients": expanded.tolist(),
+        "reward": float(sum(rewards)),
+        "average": float(terminal["average"]),
+        "objective": float(terminal["objective"]),
+        "scores": terminal["scores"],
+        "reward_stats": terminal["reward_stats"],
+        "infos": infos,
+        "coefficients_by_layer": coefficients_to_dict(
+            expanded,
+            env.layer_names,
+            env.layered_task_vectors.task_names,
+        ),
+    }
+
+
+def evaluate_coefficients_for_selection(env, args, coefficients_by_layer) -> dict:
+    position = fixed_selection_position(args)
+    return with_reward_pool_position(
+        env,
+        position,
+        lambda: evaluate_coefficients(env, coefficients_by_layer),
+    )
+
+
+def deterministic_selection_result(env, args, policy: PositiveSoftplusPolicy) -> dict:
+    position = fixed_selection_position(args)
+    return with_reward_pool_position(
+        env,
+        position,
+        lambda: deterministic_policy_result(env, policy),
+    )
+
+
 def collect_global_group(env, policy: PositiveSoftplusPolicy, group_size: int) -> dict:
     base_state = env.reset().to(env.device)
     states = base_state.unsqueeze(0).expand(group_size, -1).contiguous()
@@ -253,7 +342,11 @@ def collect_layer_group(
     iteration: int = 0,
 ) -> dict:
     if not trajectory_contexts:
-        trajectories = [evaluate_trajectory(env, policy, deterministic=False) for _ in range(group_size)]
+        trajectories = []
+        for _ in range(group_size):
+            if hasattr(env, "set_reward_pool_position"):
+                env.set_reward_pool_position(iteration)
+            trajectories.append(evaluate_trajectory(env, policy, deterministic=False))
         return _pack_layer_trajectories(env, trajectories)
 
     for context in trajectory_contexts:
@@ -275,6 +368,8 @@ def collect_layer_group(
                 torch.cuda.manual_seed(rollout_seed)
             else:
                 torch.manual_seed(rollout_seed)
+            if hasattr(context["env"], "set_reward_pool_position"):
+                context["env"].set_reward_pool_position(iteration)
             items.append((index, evaluate_trajectory(context["env"], context["policy"], deterministic=False)))
         return items
 
@@ -316,9 +411,22 @@ def collect_group(
     )
 
 
-def summarize_best(group: dict, best_sample: dict) -> dict:
-    best_index = int(torch.argmax(group["rewards"]).item())
-    result = group["results"][best_index]
+def summarize_best(group: dict, best_sample: dict, env, args) -> dict:
+    candidate_count = min(int(getattr(args, "selection_candidates", 1)), len(group["results"]))
+    top_indices = torch.topk(group["rewards"], k=candidate_count).indices.detach().cpu().tolist()
+    fixed_results = []
+    for rank, best_index in enumerate(top_indices):
+        train_result = group["results"][int(best_index)]
+        result = evaluate_coefficients_for_selection(env, args, train_result["expanded_coefficients"])
+        result["selection_rank"] = int(rank)
+        result["selection_group_index"] = int(best_index)
+        result["train_objective"] = float(train_result["objective"])
+        result["train_mean_retention"] = float(train_result["reward_stats"]["mean_retention"])
+        result["train_scores"] = train_result["scores"]
+        result["train_reward_stats"] = train_result["reward_stats"]
+        result["selection_reward_pool_position"] = fixed_selection_position(args)
+        fixed_results.append(result)
+    result = max(fixed_results, key=lambda item: item["objective"])
     if result["objective"] > best_sample["objective"]:
         best_sample.update(
             selected=result["selected"],
@@ -329,6 +437,13 @@ def summarize_best(group: dict, best_sample: dict) -> dict:
             mean_retention=float(result["reward_stats"]["mean_retention"]),
             scores=result["scores"],
             reward_stats=result["reward_stats"],
+            train_objective=result["train_objective"],
+            train_mean_retention=result["train_mean_retention"],
+            train_scores=result["train_scores"],
+            train_reward_stats=result["train_reward_stats"],
+            selection_reward_pool_position=result["selection_reward_pool_position"],
+            selection_rank=result["selection_rank"],
+            selection_group_index=result["selection_group_index"],
         )
     return result
 
@@ -370,7 +485,7 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
             grpo_epochs=args.grpo_epochs,
             target_kl=args.target_kl,
         )
-        group_best = summarize_best(group, best_sample)
+        group_best = summarize_best(group, best_sample, env, args)
 
         episode_history.append({
             "episode": iteration,
@@ -403,13 +518,14 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
             "deterministic_retention": None,
             "deterministic_objective": None,
             "deterministic_scores": None,
-            "value_loss": 0.0,
+            "value_loss": None,
+            "entropy_bonus": float(-args.entropy_coef * stats.entropy),
             **stats.__dict__,
         }
 
         should_log = (iteration + 1) % args.log_every == 0 or iteration + 1 == args.iterations
         if should_log:
-            deterministic = deterministic_policy_result(env, policy)
+            deterministic = deterministic_selection_result(env, args, policy)
             deterministic_retention = deterministic["infos"][-1]["reward_stats"]["mean_retention"]
             history_row.update(
                 deterministic_average=float(deterministic["average"]),
@@ -440,7 +556,7 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
 
 def export_results(args, env, policy: PositiveSoftplusPolicy, best_sample: dict, history: list[dict], episodes: list[dict]):
     output_dir = Path(args.output_dir)
-    final_policy = deterministic_policy_result(env, policy)
+    final_policy = deterministic_selection_result(env, args, policy)
     final_coefficients = torch.tensor(final_policy["coefficients"], dtype=torch.float32)
     best_coefficients = torch.tensor(best_sample["coefficients"], dtype=torch.float32)
 
@@ -467,7 +583,16 @@ def export_results(args, env, policy: PositiveSoftplusPolicy, best_sample: dict,
 
     encoder_path = output_dir / "encoder.pt"
     torch.save(env.export_merged_state(export_coefficients), encoder_path)
-    plot_path = plotting.plot_training_curves(history, episodes, output_dir / "training_curves.png")
+    plot_path = plotting.plot_training_curves(
+        history,
+        episodes,
+        output_dir / "training_curves.png",
+        loss_keys=(
+            ("loss", "Total Loss"),
+            ("policy_loss", "Policy Loss"),
+            ("entropy_bonus", "Entropy Bonus"),
+        ),
+    )
     reward_plot_path = plotting.plot_reward_curves(episodes, output_dir / "reward_curves.png")
 
     payload = {

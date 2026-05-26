@@ -17,6 +17,10 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--reward-split", choices=["val", "test"], default="val")
     data.add_argument("--reward-batch-size", type=int, default=32)
     data.add_argument("--reward-batches-per-dataset", type=int, default=4)
+    data.add_argument("--reward-sampling-mode", choices=["sequential", "stratified_pool"], default="sequential", help="Reward subset construction. sequential keeps the original first-N batches; stratified_pool builds a fixed class-interleaved pool and rotates chunks during training.")
+    data.add_argument("--reward-pool-size", type=int, default=0, help="Number of samples per dataset in stratified_pool mode. 0 uses reward_batch_size * reward_batches_per_dataset.")
+    data.add_argument("--selection-reward-pool-position", type=int, default=0, help="Fixed stratified reward-pool chunk used for best-checkpoint selection and deterministic logging. Set to -1 to use the current rotating position.")
+    data.add_argument("--selection-candidates", type=int, default=1, help="Number of top rotating-pool group samples to re-score on the fixed selection subset before best-checkpoint selection.")
     data.add_argument("--top-k-percent", type=float, default=20.0)
     data.add_argument("--no-download", action="store_true")
     data.add_argument("--source-baseline-json", default=None, help="Optional cached source-model baseline accuracies used as retention denominators.")
@@ -100,6 +104,8 @@ def validate_args(args: argparse.Namespace) -> None:
         "--reward-eval-interval": args.reward_eval_interval,
         "--reward-batches-per-dataset": args.reward_batches_per_dataset,
         "--reward-batch-size": args.reward_batch_size,
+        "--reward-pool-size": max(1, args.reward_pool_size) if args.reward_sampling_mode == "stratified_pool" else 1,
+        "--selection-candidates": args.selection_candidates,
     }
     for name, value in positive_ints.items():
         if value <= 0:
@@ -114,6 +120,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--log-std-min must be smaller than --log-std-max.")
     if args.activation_reward_coef < 0:
         raise ValueError("--activation-reward-coef must be non-negative.")
+    if args.reward_pool_size < 0:
+        raise ValueError("--reward-pool-size must be non-negative.")
+    if args.selection_reward_pool_position < -1:
+        raise ValueError("--selection-reward-pool-position must be -1 or non-negative.")
     if args.kl_weight < 0:
         raise ValueError("--kl-weight must be non-negative.")
     if args.agreement_weight < 0:

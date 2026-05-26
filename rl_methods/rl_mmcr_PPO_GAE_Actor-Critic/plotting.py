@@ -14,7 +14,12 @@ def _ewma(values: list[float], alpha: float) -> list[float]:
     return smoothed
 
 
-def plot_training_curves(update_history: list[dict], episode_history: list[dict], output_path: Path | str) -> Path:
+def plot_training_curves(
+    update_history: list[dict],
+    episode_history: list[dict],
+    output_path: Path | str,
+    loss_keys: tuple[tuple[str, str], ...] | None = None,
+) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), constrained_layout=True)
@@ -38,8 +43,12 @@ def plot_training_curves(update_history: list[dict], episode_history: list[dict]
 
     if update_history:
         updates = [row["update"] for row in update_history]
-        for key, label in (("loss", "Total Loss"), ("policy_loss", "Policy Loss"), ("value_loss", "Value Loss")):
-            axes[1].plot(updates, [row[key] for row in update_history], label=label)
+        if loss_keys is None:
+            loss_keys = (("loss", "Total Loss"), ("policy_loss", "Policy Loss"), ("value_loss", "Value Loss"))
+        for key, label in loss_keys:
+            values = [row.get(key) for row in update_history]
+            if any(value is not None for value in values):
+                axes[1].plot(updates, [0.0 if value is None else value for value in values], label=label)
 
     axes[1].set(title="Loss", xlabel="Update", ylabel="Loss")
     axes[1].grid(True, alpha=0.3)
