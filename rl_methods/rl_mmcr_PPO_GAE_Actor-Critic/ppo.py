@@ -8,10 +8,10 @@ import torch.nn.functional as F
 from .env import RLMMCREnv
 from .merge import coefficients_to_dict
 from .policy import (
-    HybridActorCritic,
-    deterministic_hybrid_action,
-    evaluate_hybrid_action,
-    sample_hybrid_action,
+    PositiveActorCritic,
+    deterministic_positive_action,
+    evaluate_positive_action,
+    sample_positive_action,
 )
 
 
@@ -27,13 +27,12 @@ class PPOStats:
 
 
 @torch.no_grad()
-def collect_rollout(env: RLMMCREnv, model: HybridActorCritic) -> dict:
+def collect_rollout(env: RLMMCREnv, model: PositiveActorCritic) -> dict:
     state = env.reset().to(env.device)
     rollout = {
         "states": [],
         "selected": [],
         "coefficients": [],
-        "gate_actions": [],
         "raw_weights": [],
         "log_probs": [],
         "values": [],
@@ -44,13 +43,12 @@ def collect_rollout(env: RLMMCREnv, model: HybridActorCritic) -> dict:
 
     done = False
     while not done:
-        active, coefficients, gate_action, raw_weights, log_prob, entropy, value = sample_hybrid_action(model, state)
+        active, coefficients, raw_weights, log_prob, entropy, value = sample_positive_action(model, state)
         next_state, reward, done, info = env.step(active, coefficients)
 
         rollout["states"].append(state.detach().clone())
         rollout["selected"].append(active.detach().cpu().tolist())
         rollout["coefficients"].append(coefficients.detach().cpu().tolist())
-        rollout["gate_actions"].append(gate_action.detach().clone())
         rollout["raw_weights"].append(raw_weights.detach().clone())
         rollout["log_probs"].append(log_prob.detach())
         rollout["values"].append(value.detach())
@@ -59,7 +57,7 @@ def collect_rollout(env: RLMMCREnv, model: HybridActorCritic) -> dict:
         rollout["infos"].append(info)
         state = next_state.to(env.device)
 
-    for key in ("states", "gate_actions", "raw_weights", "log_probs", "values", "entropies"):
+    for key in ("states", "raw_weights", "log_probs", "values", "entropies"):
         rollout[key] = torch.stack(rollout[key])
     return rollout
 
@@ -78,7 +76,7 @@ def compute_gae(rewards: list[float], values: torch.Tensor, gamma: float, gae_la
 
 
 def update_policy(
-    model: HybridActorCritic,
+    model: PositiveActorCritic,
     optimizer: torch.optim.Optimizer,
     rollouts: list[dict],
     *,
@@ -95,7 +93,6 @@ def update_policy(
     device: torch.device,
 ) -> PPOStats:
     states = torch.cat([rollout["states"] for rollout in rollouts], dim=0)
-    gate_actions = torch.cat([rollout["gate_actions"] for rollout in rollouts], dim=0)
     raw_weights = torch.cat([rollout["raw_weights"] for rollout in rollouts], dim=0)
     old_log_probs = torch.cat([rollout["log_probs"] for rollout in rollouts], dim=0).detach()
 
@@ -125,10 +122,9 @@ def update_policy(
 
         for start in range(0, batch_size, minibatch_size):
             indices = permutation[start : start + minibatch_size]
-            new_log_probs, entropy, values = evaluate_hybrid_action(
+            new_log_probs, entropy, values = evaluate_positive_action(
                 model,
                 states[indices],
-                gate_actions[indices],
                 raw_weights[indices],
             )
             ratios = torch.exp(new_log_probs - old_log_probs[indices])
@@ -171,7 +167,7 @@ def update_policy(
 
 
 @torch.no_grad()
-def deterministic_policy_result(env: RLMMCREnv, model: HybridActorCritic, gate_threshold: float) -> dict:
+def deterministic_policy_result(env: RLMMCREnv, model: PositiveActorCritic) -> dict:
     state = env.reset().to(env.device)
     selected_history = []
     coefficient_history = []
@@ -179,7 +175,7 @@ def deterministic_policy_result(env: RLMMCREnv, model: HybridActorCritic, gate_t
     done = False
 
     while not done:
-        selected, coefficients = deterministic_hybrid_action(model, state, gate_threshold=gate_threshold)
+        selected, coefficients = deterministic_positive_action(model, state)
         state, _, done, info = env.step(selected, coefficients)
         selected_history.append(selected.detach().cpu().tolist())
         coefficient_history.append(coefficients.detach().cpu().tolist())

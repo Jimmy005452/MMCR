@@ -148,17 +148,24 @@ def build_synthetic_reward_batches(
     batch_size: int,
     batches_per_dataset: int,
     include_rejected: bool = False,
+    sampling_mode: str = "sequential",
+    reward_pool_size: int = 0,
+    seed: int = 0,
 ):
     if batches_per_dataset <= 0:
         raise ValueError("batches_per_dataset must be positive.")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
+    if sampling_mode not in {"sequential", "stratified_pool"}:
+        raise ValueError("sampling_mode must be either 'sequential' or 'stratified_pool'.")
+    if reward_pool_size < 0:
+        raise ValueError("reward_pool_size must be non-negative.")
 
     root = Path(synthesis_root)
     reward_batches = {}
-    max_samples = batch_size * batches_per_dataset
+    batches_per_eval = None
 
-    for dataset in tqdm(datasets, desc="synthetic reward batches", leave=False):
+    for dataset_index, dataset in enumerate(tqdm(datasets, desc="synthetic reward batches", leave=False)):
         folder = root / dataset
         inputs_path = folder / "inputs.pt"
         logits_path = folder / "teacher_logits.pt"
@@ -171,6 +178,15 @@ def build_synthetic_reward_batches(
         if inputs.shape[0] != teacher_logits.shape[0]:
             raise ValueError(f"{dataset}: inputs and teacher_logits have different lengths.")
 
+        pseudo_labels = None
+        pseudo_labels_path = folder / "pseudo_labels.pt"
+        if pseudo_labels_path.exists():
+            pseudo_labels = torch.load(pseudo_labels_path, map_location="cpu")
+            if pseudo_labels.shape[0] != inputs.shape[0]:
+                raise ValueError(f"{dataset}: pseudo_labels length does not match inputs.")
+        elif sampling_mode == "stratified_pool":
+            raise FileNotFoundError(f"{dataset}: stratified synthetic reward sampling requires {pseudo_labels_path}.")
+
         mask_path = folder / "accepted_mask.pt"
         if not include_rejected and mask_path.exists():
             mask = torch.load(mask_path, map_location="cpu").bool()
@@ -180,16 +196,31 @@ def build_synthetic_reward_batches(
                 raise ValueError(f"{dataset}: accepted_mask has zero accepted samples. Use --include-rejected-synthetic.")
             inputs = inputs[mask]
             teacher_logits = teacher_logits[mask]
+            if pseudo_labels is not None:
+                pseudo_labels = pseudo_labels[mask]
 
-        inputs = inputs[:max_samples].cpu()
-        teacher_logits = teacher_logits[:max_samples].cpu()
+        if sampling_mode == "sequential":
+            max_samples = batch_size * batches_per_dataset
+            inputs = inputs[:max_samples].cpu()
+            teacher_logits = teacher_logits[:max_samples].cpu()
+        else:
+            eval_samples = batch_size * batches_per_dataset
+            pool_size = reward_pool_size if reward_pool_size > 0 else eval_samples
+            pool_size = max(pool_size, eval_samples)
+            pool_size = min(pool_size, int(inputs.shape[0]))
+            targets = [int(value) for value in pseudo_labels.tolist()]
+            indices = _stratified_interleaved_indices(targets, pool_size, seed + dataset_index)
+            inputs = inputs[indices].cpu()
+            teacher_logits = teacher_logits[indices].cpu()
+            batches_per_eval = batches_per_dataset
+
         batches = []
         for start in range(0, inputs.shape[0], batch_size):
-            if len(batches) == batches_per_dataset:
+            if sampling_mode == "sequential" and len(batches) == batches_per_dataset:
                 break
             batches.append((inputs[start : start + batch_size], teacher_logits[start : start + batch_size]))
         if not batches:
             raise RuntimeError(f"No synthetic reward batches were collected for dataset '{dataset}'.")
         reward_batches[dataset] = batches
 
-    return RewardBatchPool(reward_batches, sampling_mode="sequential")
+    return RewardBatchPool(reward_batches, sampling_mode=sampling_mode, batches_per_eval=batches_per_eval)

@@ -16,3 +16,8 @@ synthesis_data/generated*/
 
 .idea/
 .vscode/
+
+# Training artifacts
+results/
+*_runs/
+*.log

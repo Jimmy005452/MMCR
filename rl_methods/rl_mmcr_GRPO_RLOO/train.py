@@ -450,26 +450,47 @@ def summarize_best(group: dict, best_sample: dict, env, args) -> dict:
 
 def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Optimizer, trajectory_contexts: list[dict] | None = None):
     best_sample = {"objective": float("-inf"), "mean_retention": float("-inf")}
+    best_policy_state = None
     update_history = []
     episode_history = []
     progress = tqdm(total=args.iterations, desc="RL-MMCR-GRPO")
 
     for iteration in range(args.iterations):
-        group = collect_group(
-            env,
-            policy,
-            args.group_size,
-            trajectory_contexts=trajectory_contexts,
-            seed=args.seed,
-            iteration=iteration,
-        )
-        trajectory_advantages = compute_advantages(group["rewards"], args.advantage_mode)
-        advantages = trajectory_advantages
-        if "trajectory_lengths" in group:
-            advantages = torch.repeat_interleave(
-                trajectory_advantages,
-                torch.tensor(group["trajectory_lengths"], dtype=torch.long, device=env.device),
+        dynamic_resamples = 0
+        while True:
+            group = collect_group(
+                env,
+                policy,
+                args.group_size,
+                trajectory_contexts=trajectory_contexts,
+                seed=args.seed + dynamic_resamples * 10000000,
+                iteration=iteration,
             )
+            group_reward_std = float(group["rewards"].std(unbiased=False).item())
+            should_resample = (
+                args.dynamic_sampling_min_std > 0
+                and group_reward_std < args.dynamic_sampling_min_std
+                and dynamic_resamples < args.dynamic_sampling_max_resamples
+            )
+            if not should_resample:
+                break
+            dynamic_resamples += 1
+
+        rollout_policy_state = {
+            key: value.detach().cpu().clone()
+            for key, value in policy.state_dict().items()
+        }
+        trajectory_advantages = compute_advantages(group["rewards"], args.advantage_mode)
+        trajectory_lengths = group.get("trajectory_lengths", [1 for _ in group["results"]])
+        if args.policy_loss_mode == "trajectory":
+            advantages = trajectory_advantages
+        else:
+            advantages = trajectory_advantages
+            if "trajectory_lengths" in group:
+                advantages = torch.repeat_interleave(
+                    trajectory_advantages,
+                    torch.tensor(trajectory_lengths, dtype=torch.long, device=env.device),
+                )
         stats = update_policy(
             policy,
             optimizer,
@@ -484,8 +505,17 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
             entropy_coef=args.entropy_coef,
             grpo_epochs=args.grpo_epochs,
             target_kl=args.target_kl,
+            policy_loss_mode=args.policy_loss_mode,
+            trajectory_lengths=trajectory_lengths if args.policy_loss_mode == "trajectory" else None,
+            clip_eps_low=args.clip_eps_low,
+            clip_eps_high=args.clip_eps_high,
         )
+        previous_best_objective = float(best_sample["objective"])
         group_best = summarize_best(group, best_sample, env, args)
+        if float(best_sample["objective"]) > previous_best_objective:
+            best_policy_state = rollout_policy_state
+            best_sample["policy_iteration"] = int(iteration)
+            best_sample["policy_update"] = int(iteration + 1)
 
         episode_history.append({
             "episode": iteration,
@@ -504,7 +534,11 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
             "episode": iteration,
             "episodes_completed": iteration + 1,
             "group_reward_mean": float(group["rewards"].mean().item()),
-            "group_reward_std": float(group["rewards"].std(unbiased=False).item()),
+            "group_reward_std": group_reward_std,
+            "dynamic_resamples": int(dynamic_resamples),
+            "policy_loss_mode": args.policy_loss_mode,
+            "clip_eps_low": float(args.clip_eps if args.clip_eps_low is None else args.clip_eps_low),
+            "clip_eps_high": float(args.clip_eps if args.clip_eps_high is None else args.clip_eps_high),
             "group_objective_mean": float(sum(group["objectives"]) / len(group["objectives"])),
             "group_retention_mean": float(sum(group["retentions"]) / len(group["retentions"])),
             "trajectory_lengths": group.get("trajectory_lengths", [1 for _ in group["results"]]),
@@ -551,14 +585,37 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
         )
 
     progress.close()
-    return best_sample, update_history, episode_history
+    return best_sample, best_policy_state, update_history, episode_history
 
 
-def export_results(args, env, policy: PositiveSoftplusPolicy, best_sample: dict, history: list[dict], episodes: list[dict]):
+def policy_state_dict_cpu(policy: PositiveSoftplusPolicy) -> dict[str, torch.Tensor]:
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in policy.state_dict().items()
+    }
+
+
+def save_policy_artifact(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+
+
+def export_results(
+    args,
+    env,
+    policy: PositiveSoftplusPolicy,
+    best_sample: dict,
+    best_policy_state: dict[str, torch.Tensor] | None,
+    history: list[dict],
+    episodes: list[dict],
+):
     output_dir = Path(args.output_dir)
     final_policy = deterministic_selection_result(env, args, policy)
     final_coefficients = torch.tensor(final_policy["coefficients"], dtype=torch.float32)
     best_coefficients = torch.tensor(best_sample["coefficients"], dtype=torch.float32)
+    final_policy_state = policy_state_dict_cpu(policy)
+    if best_policy_state is None:
+        best_policy_state = final_policy_state
 
     if args.export_policy == "best":
         export_coefficients = best_coefficients
@@ -581,8 +638,51 @@ def export_results(args, env, policy: PositiveSoftplusPolicy, best_sample: dict,
             "reward_stats": terminal_stats,
         }
 
+    best_encoder_path = output_dir / "best_encoder.pt"
+    final_encoder_path = output_dir / "final_encoder.pt"
     encoder_path = output_dir / "encoder.pt"
-    torch.save(env.export_merged_state(export_coefficients), encoder_path)
+    best_encoder_state = env.export_merged_state(best_coefficients)
+    final_encoder_state = env.export_merged_state(final_coefficients)
+    torch.save(best_encoder_state, best_encoder_path)
+    torch.save(final_encoder_state, final_encoder_path)
+    torch.save(best_encoder_state if args.export_policy == "best" else final_encoder_state, encoder_path)
+
+    best_policy_path = output_dir / "best_policy.pt"
+    final_policy_path = output_dir / "final_policy.pt"
+    save_policy_artifact(
+        best_policy_path,
+        {
+            "type": "best_group_sample",
+            "policy_state_dict": best_policy_state,
+            "coefficients": best_sample["coefficients"],
+            "expanded_coefficients": best_sample["expanded_coefficients"],
+            "objective": float(best_sample["objective"]),
+            "mean_accuracy": float(best_sample["mean_accuracy"]),
+            "mean_retention": float(best_sample["mean_retention"]),
+            "scores": best_sample["scores"],
+            "reward_stats": best_sample["reward_stats"],
+            "policy_iteration": best_sample.get("policy_iteration"),
+            "policy_update": best_sample.get("policy_update"),
+            "config": vars(args),
+        },
+    )
+    final_terminal_stats = final_policy["infos"][-1]["reward_stats"]
+    save_policy_artifact(
+        final_policy_path,
+        {
+            "type": "final_deterministic",
+            "policy_state_dict": final_policy_state,
+            "coefficients": final_policy["coefficients"],
+            "expanded_coefficients": final_policy["expanded_coefficients"],
+            "objective": float(final_policy["objective"]),
+            "mean_accuracy": float(final_policy["average"]),
+            "mean_retention": float(final_terminal_stats["mean_retention"]),
+            "scores": final_policy["scores"],
+            "reward_stats": final_terminal_stats,
+            "config": vars(args),
+        },
+    )
+
     plot_path = plotting.plot_training_curves(
         history,
         episodes,
@@ -602,14 +702,19 @@ def export_results(args, env, policy: PositiveSoftplusPolicy, best_sample: dict,
         "num_models": env.num_models,
         "num_layers": env.num_layers,
         "layer_names": env.layer_names,
-        "action_type": f"{args.merge_granularity}_grpo_rloo_positive_softplus_coefficients",
+        "action_type": f"{args.merge_granularity}_{args.coefficient_granularity}_grpo_rloo_positive_softplus_coefficients",
         "merge_granularity": args.merge_granularity,
+        "coefficient_granularity": args.coefficient_granularity,
         "exported_policy": exported_policy,
         "final_policy": final_policy,
         "best_sample": best_sample,
         "history": history,
         "episode_history": episodes,
         "encoder_path": str(encoder_path),
+        "best_encoder_path": str(best_encoder_path),
+        "final_encoder_path": str(final_encoder_path),
+        "best_policy_path": str(best_policy_path),
+        "final_policy_path": str(final_policy_path),
         "plot_path": str(plot_path),
         "reward_plot_path": str(reward_plot_path),
     }
@@ -629,7 +734,7 @@ def export_results(args, env, policy: PositiveSoftplusPolicy, best_sample: dict,
         )
 
     write_json(output_dir / "results.json", payload)
-    return encoder_path, plot_path, reward_plot_path
+    return encoder_path, plot_path, reward_plot_path, best_encoder_path, final_encoder_path, best_policy_path, final_policy_path
 
 
 def main() -> None:
@@ -657,10 +762,22 @@ def main() -> None:
         devices = ", ".join(str(context["device"]) for context in trajectory_contexts)
         print(f"Using trajectory devices: {devices}")
 
-    best_sample, history, episode_history = train(args, env, policy, optimizer, trajectory_contexts)
-    encoder_path, plot_path, reward_plot_path = export_results(args, env, policy, best_sample, history, episode_history)
+    best_sample, best_policy_state, history, episode_history = train(args, env, policy, optimizer, trajectory_contexts)
+    encoder_path, plot_path, reward_plot_path, best_encoder_path, final_encoder_path, best_policy_path, final_policy_path = export_results(
+        args,
+        env,
+        policy,
+        best_sample,
+        best_policy_state,
+        history,
+        episode_history,
+    )
     print(f"Saved GRPO/RLOO results to {output_dir / 'results.json'}")
     print(f"Saved merged encoder to {encoder_path}")
+    print(f"Saved best encoder to {best_encoder_path}")
+    print(f"Saved final encoder to {final_encoder_path}")
+    print(f"Saved best policy to {best_policy_path}")
+    print(f"Saved final policy to {final_policy_path}")
     print(f"Saved training curves to {plot_path}")
     print(f"Saved reward curves to {reward_plot_path}")
 

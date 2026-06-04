@@ -96,10 +96,12 @@ class GRPOStats:
 
 def compute_advantages(rewards: torch.Tensor, mode: str) -> torch.Tensor:
     rewards = rewards.float()
-    if mode == "rloo":
+    if mode in {"rloo", "rloo_no_std"}:
         group_size = rewards.numel()
         leave_one_out = (rewards.sum() - rewards) / max(group_size - 1, 1)
         advantages = rewards - leave_one_out
+        if mode == "rloo_no_std":
+            return advantages
         return advantages / advantages.std(unbiased=False).clamp(min=1e-8)
     if mode == "zscore":
         return (rewards - rewards.mean()) / rewards.std(unbiased=False).clamp(min=1e-8)
@@ -108,6 +110,18 @@ def compute_advantages(rewards: torch.Tensor, mode: str) -> torch.Tensor:
         ranks = order.float() / max(rewards.numel() - 1, 1)
         return (ranks - 0.5) * 2.0
     raise ValueError(f"Unknown advantage mode: {mode}")
+
+
+def _segment_sum(values: torch.Tensor, lengths: list[int] | tuple[int, ...]) -> torch.Tensor:
+    pieces = []
+    offset = 0
+    for length in lengths:
+        next_offset = offset + int(length)
+        pieces.append(values[offset:next_offset].sum())
+        offset = next_offset
+    if offset != int(values.shape[0]):
+        raise ValueError(f"Trajectory lengths sum to {offset}, but tensor has {values.shape[0]} rows.")
+    return torch.stack(pieces)
 
 
 def update_policy(
@@ -125,15 +139,40 @@ def update_policy(
     entropy_coef: float,
     grpo_epochs: int,
     target_kl: float,
+    policy_loss_mode: str = "step",
+    trajectory_lengths: list[int] | None = None,
+    clip_eps_low: float | None = None,
+    clip_eps_high: float | None = None,
 ) -> GRPOStats:
+    if policy_loss_mode not in {"step", "trajectory"}:
+        raise ValueError("policy_loss_mode must be either 'step' or 'trajectory'.")
+    lower_clip = 1.0 - float(clip_eps if clip_eps_low is None else clip_eps_low)
+    upper_clip = 1.0 + float(clip_eps if clip_eps_high is None else clip_eps_high)
+    if lower_clip <= 0 or upper_clip <= lower_clip:
+        raise ValueError("Invalid clipping range. Expected 0 < 1 - clip_eps_low < 1 + clip_eps_high.")
+    if policy_loss_mode == "trajectory":
+        if trajectory_lengths is None:
+            trajectory_lengths = [1 for _ in range(int(states.shape[0]))]
+        if len(advantages) != len(trajectory_lengths):
+            raise ValueError("Trajectory-level policy loss expects one advantage per trajectory.")
+    elif len(advantages) != int(states.shape[0]):
+        raise ValueError("Step-level policy loss expects one advantage per action step.")
+
     last = {"loss": None, "policy": None, "entropy": None, "kl": None, "clip": None, "epochs": 0}
 
     for epoch in range(grpo_epochs):
         mean, log_std = policy.distribution_params(states)
         log_probs = log_prob_from_raw(raw_actions, mean, log_std)
         entropy = (log_std + 0.5 * (1.0 + math.log(2.0 * math.pi)) + mean).sum(dim=-1).mean()
-        ratios = torch.exp(log_probs - old_log_probs)
-        clipped = torch.clamp(ratios, 1.0 - clip_eps, 1.0 + clip_eps)
+
+        if policy_loss_mode == "trajectory":
+            new_traj_log_probs = _segment_sum(log_probs, trajectory_lengths)
+            old_traj_log_probs = _segment_sum(old_log_probs, trajectory_lengths)
+            ratios = torch.exp(new_traj_log_probs - old_traj_log_probs)
+        else:
+            ratios = torch.exp(log_probs - old_log_probs)
+
+        clipped = torch.clamp(ratios, lower_clip, upper_clip)
         policy_loss = -torch.min(ratios * advantages, clipped * advantages).mean()
         loss = policy_loss - entropy_coef * entropy
 
@@ -144,9 +183,15 @@ def update_policy(
         with torch.no_grad():
             new_mean, new_log_std = policy.distribution_params(states)
             updated_log_probs = log_prob_from_raw(raw_actions, new_mean, new_log_std)
-            updated_ratios = torch.exp(updated_log_probs - old_log_probs)
-            approx_kl = independent_normal_kl(old_mean, old_log_std, new_mean, new_log_std).mean()
-            clip_fraction = (updated_ratios.sub(1.0).abs() > clip_eps).float().mean()
+            step_kl = independent_normal_kl(old_mean, old_log_std, new_mean, new_log_std)
+            if policy_loss_mode == "trajectory":
+                updated_traj_log_probs = _segment_sum(updated_log_probs, trajectory_lengths)
+                updated_ratios = torch.exp(updated_traj_log_probs - old_traj_log_probs)
+                approx_kl = _segment_sum(step_kl, trajectory_lengths).mean()
+            else:
+                updated_ratios = torch.exp(updated_log_probs - old_log_probs)
+                approx_kl = step_kl.mean()
+            clip_fraction = ((updated_ratios < lower_clip) | (updated_ratios > upper_clip)).float().mean()
         last.update(loss=loss, policy=policy_loss, entropy=entropy, kl=approx_kl, clip=clip_fraction, epochs=epoch + 1)
         if approx_kl.item() > target_kl:
             break

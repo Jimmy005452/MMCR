@@ -13,30 +13,32 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--checkpoint-root", default="checkpoints")
     data.add_argument("--zeroshot", default=None)
     data.add_argument("--data-root", default="data")
+    data.add_argument("--synthesis-root", default="synthesis_data/generated")
     data.add_argument("--reward-split", choices=["val", "test"], default="val")
     data.add_argument("--reward-batch-size", type=int, default=16)
     data.add_argument("--reward-batches-per-dataset", type=int, default=1)
     data.add_argument("--reward-sampling-mode", choices=["sequential", "stratified_pool"], default="sequential", help="Reward subset construction. sequential keeps the original first-N batches; stratified_pool builds a fixed class-interleaved pool and rotates chunks during training.")
     data.add_argument("--reward-pool-size", type=int, default=0, help="Number of samples per dataset in stratified_pool mode. 0 uses reward_batch_size * reward_batches_per_dataset.")
     data.add_argument("--top-k-percent", type=float, default=20.0)
+    data.add_argument("--task-vector-mode", choices=["ties", "raw"], default="ties", help="Task-vector preprocessing. ties uses TIES sign/top-k selection; raw uses full finetuned - zeroshot deltas.")
     data.add_argument("--no-download", action="store_true")
     data.add_argument("--source-baseline-json", default=None, help="Optional cached source-model baseline accuracies used as retention denominators.")
+    data.add_argument("--include-rejected-synthetic", action="store_true", help="Use all synthetic samples instead of accepted_mask-filtered samples.")
 
     model = parser.add_argument_group("model")
     model.add_argument("--arch", default=DEFAULT_ARCH)
     model.add_argument("--policy-hidden-dim", type=int, default=64)
-    model.add_argument("--gate-threshold", type=float, default=0.5)
-    model.add_argument(
-        "--action-mode",
-        choices=["coefficients_only", "hybrid"],
-        default="coefficients_only",
-        help="Use coefficients_only to optimize continuous coefficients without binary gates.",
-    )
     model.add_argument(
         "--merge-granularity",
         choices=["layer", "global"],
         default="layer",
         help="Use layer for layer-wise coefficients or global for one coefficient vector shared by all layers.",
+    )
+    model.add_argument(
+        "--coefficient-granularity",
+        choices=["layer", "tensor"],
+        default="layer",
+        help="Grouping used when merge-granularity=layer. layer shares one coefficient vector per transformer layer; tensor uses one coefficient vector per floating-point tensor.",
     )
     model.add_argument(
         "--state-mode",
@@ -50,6 +52,8 @@ def parse_args() -> argparse.Namespace:
         default="positive",
     )
     model.add_argument("--coefficient-init", type=float, default=0.3)
+    model.add_argument("--log-std-min", type=float, default=-5.0)
+    model.add_argument("--log-std-max", type=float, default=1.0)
     model.add_argument("--export-policy", choices=["best", "final"], default="best")
 
     train = parser.add_argument_group("training")
@@ -60,6 +64,10 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--value-coef", type=float, default=0.5)
     train.add_argument("--terminal-bonus", type=float, default=1.0)
     train.add_argument("--reward-scale", type=float, default=1.0)
+    train.add_argument("--reward-mode", choices=["accuracy_retention", "entropy", "synthetic_entropy", "synthetic_proxy"], default="accuracy_retention")
+    train.add_argument("--kl-weight", type=float, default=1.0)
+    train.add_argument("--agreement-weight", type=float, default=0.5)
+    train.add_argument("--entropy-weight", type=float, default=0.1)
     train.add_argument("--activation-reward-coef", type=float, default=0.0, help="Dense layer-wise reward coefficient for cosine similarity between merged and source-model activations.")
     train.add_argument("--step-reward-coef", type=float, default=0.25)
     train.add_argument("--accuracy-imbalance-coef", type=float, default=0.5)
@@ -106,7 +114,17 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive.")
     if args.coefficient_init <= 0:
         raise ValueError("--coefficient-init must be positive.")
+    if args.log_std_min >= args.log_std_max:
+        raise ValueError("--log-std-min must be smaller than --log-std-max.")
     if args.activation_reward_coef < 0:
         raise ValueError("--activation-reward-coef must be non-negative.")
     if args.reward_pool_size < 0:
         raise ValueError("--reward-pool-size must be non-negative.")
+    if args.kl_weight < 0:
+        raise ValueError("--kl-weight must be non-negative.")
+    if args.agreement_weight < 0:
+        raise ValueError("--agreement-weight must be non-negative.")
+    if args.entropy_weight < 0:
+        raise ValueError("--entropy-weight must be non-negative.")
+    if args.reward_mode != "accuracy_retention" and args.activation_reward_coef != 0:
+        raise ValueError("--activation-reward-coef is only supported with --reward-mode accuracy_retention for now.")

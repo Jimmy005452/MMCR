@@ -174,3 +174,38 @@ pass these thresholds:
 For data-free reward experiments, start by checking whether low KL on these
 synthetic inputs correlates with real validation accuracy before replacing the
 current RL reward.
+
+## Validate synthetic logits against real logits
+
+`validate_logit_similarity.py` checks whether synthetic samples look like real
+same-class samples in the source model's logit space. This is a diagnostic only:
+it uses real dataset images, so do not use this score as a data-free training
+reward.
+
+```bash
+python -m synthesis_data.validate_logit_similarity \
+  --synthesis-root synthesis_data/generated_strat1024 \
+  --datasets sun397 stanford_cars resisc45 eurosat svhn gtsrb mnist dtd \
+  --checkpoint-root checkpoints \
+  --data-root data \
+  --real-split val \
+  --real-samples-per-class 16 \
+  --top-k 5 \
+  --batch-size 64 \
+  --gpu 0 \
+  --amp \
+  --output-json results/synthetic_logit_similarity_strat1024.json \
+  --output-txt results/synthetic_logit_similarity_strat1024.txt
+```
+
+The report includes:
+
+- `same_class_nn_cos`: nearest cosine similarity to a real sample from the same class.
+- `same_class_topk_cos`: average of the top-k same-class cosine similarities.
+- `wrong_class_nn_cos`: nearest cosine similarity to a real sample from another class.
+- `logit_margin`: `same_class_nn_cos - wrong_class_nn_cos`.
+- `top1_match_to_real_centroid`: whether the nearest real class centroid matches the synthetic pseudo-label.
+
+Higher `same_class_*`, higher `logit_margin`, lower `wrong_class_nn_cos`, and
+higher centroid match generally indicate more realistic synthetic logits.
+

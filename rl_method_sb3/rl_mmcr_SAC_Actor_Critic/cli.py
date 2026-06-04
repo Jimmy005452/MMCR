@@ -26,47 +26,29 @@ def parse_args() -> argparse.Namespace:
     model.add_argument("--critic-hidden-dim", type=int, default=256)
     model.add_argument("--merge-granularity", choices=["layer", "global"], default="layer")
     model.add_argument(
-        "--coefficient-granularity",
-        choices=["layer", "tensor"],
-        default="layer",
-        help="Grouping used when merge-granularity=layer. layer shares one coefficient vector per transformer layer; tensor uses one coefficient vector per floating-point tensor.",
-    )
-    model.add_argument(
         "--state-mode",
         choices=["minimal", "full_coefficients"],
         default="minimal",
-        help="State representation used by policy/value networks.",
+        help="State representation used by the underlying MMCR environment.",
     )
     model.add_argument("--coefficient-mode", choices=["positive"], default="positive")
-    model.add_argument("--coefficient-init", type=float, default=0.3)
+    model.add_argument("--coefficient-init", type=float, default=0.3, help="Initial coefficients used by the MMCR environment before the first action.")
+    model.add_argument("--action-max", type=float, default=10.0, help="Upper bound for each positive coefficient in the SB3 Box action space.")
+    model.add_argument("--log-std-init", type=float, default=-2.0, help="Initial log standard deviation used by the SB3 SAC policy.")
     model.add_argument("--export-policy", choices=["best", "final"], default="best")
 
-    train = parser.add_argument_group("training")
+    train = parser.add_argument_group("sb3 sac training")
     train.add_argument("--episodes", type=int, default=300)
     train.add_argument("--gamma", type=float, default=1.0)
-    train.add_argument("--lr", type=float, default=3e-4)
-    train.add_argument("--critic-lr", type=float, default=3e-4)
-    train.add_argument("--alpha-lr", type=float, default=3e-4)
+    train.add_argument("--lr", type=float, default=3e-4, help="SB3 SAC learning_rate for policy, critics, and entropy coefficient optimizer.")
     train.add_argument("--batch-size", type=int, default=128)
-    train.add_argument("--replay-size", type=int, default=50000)
-    train.add_argument(
-        "--random-steps",
-        type=int,
-        default=200,
-        help="Number of environment steps sampled from independent Uniform(0, 1) positive coefficients before SAC updates use the actor.",
-    )
-    train.add_argument("--updates-per-step", type=int, default=1)
-    train.add_argument("--actor-update-delay", type=int, default=1, help="Update the actor once every N critic updates. Values >1 make SAC more TD3-like and reduce critic exploitation.")
-    train.add_argument("--freeze-actor-during-random-steps", action="store_true", help="Collect random replay and train only critics until --random-steps is exhausted.")
-    train.add_argument("--action-anchor-coef", type=float, default=0.0, help="Penalty coefficient for keeping actor-sampled coefficients near --coefficient-init.")
-    train.add_argument("--cql-coef", type=float, default=0.0, help="Conservative Q penalty coefficient. Penalizes actor-sampled actions whose Q exceeds replay-action Q.")
+    train.add_argument("--buffer-size", type=int, default=50000)
+    train.add_argument("--learning-starts", type=int, default=200, help="Number of environment steps before SB3 starts gradient updates.")
+    train.add_argument("--train-freq", type=int, default=1, help="SB3 train_freq in environment steps.")
+    train.add_argument("--gradient-steps", type=int, default=1, help="SB3 gradient_steps per train_freq.")
     train.add_argument("--tau", type=float, default=0.005)
-    train.add_argument("--alpha", type=float, default=0.02)
-    train.add_argument("--auto-alpha", action="store_true")
-    train.add_argument("--target-entropy", type=float, default=None)
-    train.add_argument("--min-concentration", type=float, default=0.05, help="Kept for compatibility with older Dirichlet SAC runs; unused by the positive softplus-normal actor.")
-    train.add_argument("--log-std-min", type=float, default=-5.0)
-    train.add_argument("--log-std-max", type=float, default=1.0)
+    train.add_argument("--ent-coef", default="0.02", help="SB3 SAC ent_coef: a float, 'auto', or 'auto_<initial_value>'.")
+    train.add_argument("--target-entropy", default="auto", help="SB3 SAC target_entropy: 'auto' or a float.")
     train.add_argument("--terminal-bonus", type=float, default=1.0)
     train.add_argument("--reward-scale", type=float, default=1.0)
     train.add_argument("--activation-reward-coef", type=float, default=0.0, help="Dense layer-wise reward coefficient for cosine similarity between merged and source-model activations.")
@@ -79,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--log-every", type=int, default=10)
 
     runtime = parser.add_argument_group("runtime")
-    runtime.add_argument("--output-dir", default="rl_mmcr_SAC_Actor_Critic_runs/default")
+    runtime.add_argument("--output-dir", default="rl_method_sb3_runs/rl_mmcr_SAC_Actor_Critic/default")
     runtime.add_argument("--gpu", type=int, default=0)
     runtime.add_argument("--num-workers", type=int, default=4)
     runtime.add_argument("--seed", type=int, default=2026)
@@ -87,6 +69,16 @@ def parse_args() -> argparse.Namespace:
     runtime.add_argument("--cache-task-vectors-device", action="store_true")
     runtime.add_argument("--skip-final-eval", action="store_true")
     return parser.parse_args()
+
+
+def parse_float_or_auto(value: str, *, allow_auto_prefix: bool = False) -> str | float:
+    lowered = value.lower()
+    if lowered == "auto":
+        return "auto"
+    if allow_auto_prefix and lowered.startswith("auto_"):
+        float(lowered.split("_", maxsplit=1)[1])
+        return lowered
+    return float(value)
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -97,26 +89,23 @@ def validate_args(args: argparse.Namespace) -> None:
         "--reward-batches-per-dataset": args.reward_batches_per_dataset,
         "--reward-batch-size": args.reward_batch_size,
         "--batch-size": args.batch_size,
-        "--replay-size": args.replay_size,
-        "--updates-per-step": args.updates_per_step,
-        "--actor-update-delay": args.actor_update_delay,
+        "--buffer-size": args.buffer_size,
+        "--train-freq": args.train_freq,
+        "--gradient-steps": args.gradient_steps,
     }
     for name, value in positive_ints.items():
         if value <= 0:
             raise ValueError(f"{name} must be positive.")
-    if args.random_steps < 0:
-        raise ValueError("--random-steps must be non-negative.")
+    if args.learning_starts < 0:
+        raise ValueError("--learning-starts must be non-negative.")
     if args.coefficient_mode == "positive" and args.coefficient_init <= 0:
         raise ValueError("--coefficient-init must be positive when --coefficient-mode positive.")
+    if args.action_max <= 0:
+        raise ValueError("--action-max must be positive.")
     if args.tau <= 0 or args.tau > 1:
         raise ValueError("--tau must be in (0, 1].")
-    if args.min_concentration <= 0:
-        raise ValueError("--min-concentration must be positive.")
-    if args.log_std_min >= args.log_std_max:
-        raise ValueError("--log-std-min must be smaller than --log-std-max.")
     if args.activation_reward_coef < 0:
         raise ValueError("--activation-reward-coef must be non-negative.")
-    if args.action_anchor_coef < 0:
-        raise ValueError("--action-anchor-coef must be non-negative.")
-    if args.cql_coef < 0:
-        raise ValueError("--cql-coef must be non-negative.")
+
+    args.ent_coef = parse_float_or_auto(args.ent_coef, allow_auto_prefix=True)
+    args.target_entropy = parse_float_or_auto(args.target_entropy)

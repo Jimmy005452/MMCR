@@ -1,7 +1,7 @@
 """PPO-GAE Actor-Critic RL-MMCR package built on the shared ``mmcr`` modules."""
 
 __all__ = [
-    "HybridActorCritic",
+    "PositiveActorCritic",
     "LayeredTaskVectors",
     "RLMMCREnv",
     "coefficients_to_dict",
@@ -15,10 +15,10 @@ def __getattr__(name: str):
         from .env import RLMMCREnv
 
         return RLMMCREnv
-    if name == "HybridActorCritic":
-        from .policy import HybridActorCritic
+    if name == "PositiveActorCritic":
+        from .policy import PositiveActorCritic
 
-        return HybridActorCritic
+        return PositiveActorCritic
     if name in {
         "LayeredTaskVectors",
         "coefficients_to_dict",

@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from mmcr.adamerging import load_ties_task_vectors
+from mmcr.task_vectors import load_state_dict
 
 
 @dataclass(frozen=True)
@@ -46,11 +47,31 @@ def _group_layers(task_vectors: list[dict[str, torch.Tensor]]) -> tuple[list[str
     return list(layer_to_keys), layer_to_keys
 
 
+def _group_tensors(task_vectors: list[dict[str, torch.Tensor]]) -> tuple[list[str], dict[str, list[str]]]:
+    if not task_vectors:
+        raise ValueError("task_vectors must not be empty.")
+
+    tensor_names = list(task_vectors[0])
+    return tensor_names, {tensor_name: [tensor_name] for tensor_name in tensor_names}
+
+
+def _group_task_vectors(
+    task_vectors: list[dict[str, torch.Tensor]],
+    granularity: str = "layer",
+) -> tuple[list[str], dict[str, list[str]]]:
+    if granularity == "layer":
+        return _group_layers(task_vectors)
+    if granularity == "tensor":
+        return _group_tensors(task_vectors)
+    raise ValueError(f"Unknown coefficient granularity: {granularity}. Expected 'layer' or 'tensor'.")
+
+
 def load_layered_ties_task_vectors(
     zeroshot_path: Path | str,
     finetuned_paths: list[Path | str],
     task_names: list[str],
     top_k_percent: float = 20,
+    granularity: str = "layer",
     map_location: str = "cpu",
 ) -> LayeredTaskVectors:
     if len(finetuned_paths) != len(task_names):
@@ -62,7 +83,7 @@ def load_layered_ties_task_vectors(
         top_k_percent=top_k_percent,
         map_location=map_location,
     )
-    layer_names, layer_to_keys = _group_layers(task_vectors)
+    layer_names, layer_to_keys = _group_task_vectors(task_vectors, granularity=granularity)
     return LayeredTaskVectors(
         pretrained_state=pretrained_state,
         finetuned_paths=[Path(path) for path in finetuned_paths],
@@ -71,6 +92,95 @@ def load_layered_ties_task_vectors(
         layer_names=layer_names,
         layer_to_keys=layer_to_keys,
     )
+
+
+def _common_floating_keys(
+    pretrained_state: dict[str, torch.Tensor],
+    finetuned_paths: list[Path],
+    map_location: str = "cpu",
+) -> list[str]:
+    keys = [key for key, value in pretrained_state.items() if torch.is_floating_point(value)]
+    for path in finetuned_paths:
+        state = load_state_dict(path, map_location=map_location)
+        kept = []
+        for key in keys:
+            if key not in state:
+                print(f"Warning: {key} is missing from {path}; skipping.", flush=True)
+                continue
+            if state[key].shape != pretrained_state[key].shape:
+                print(f"Warning: {key} has mismatched shape in {path}; skipping.", flush=True)
+                continue
+            kept.append(key)
+        keys = kept
+        del state
+    return keys
+
+
+def load_layered_raw_task_vectors(
+    zeroshot_path: Path | str,
+    finetuned_paths: list[Path | str],
+    task_names: list[str],
+    top_k_percent: float = 100,
+    granularity: str = "layer",
+    map_location: str = "cpu",
+) -> LayeredTaskVectors:
+    if len(finetuned_paths) != len(task_names):
+        raise ValueError("finetuned_paths and task_names must have the same length.")
+
+    pretrained_state = load_state_dict(zeroshot_path, map_location=map_location)
+    paths = [Path(path) for path in finetuned_paths]
+    keys = _common_floating_keys(pretrained_state, paths, map_location=map_location)
+    print(f"Loading raw task vectors from {len(paths)} checkpoints over {len(keys)} floating-point tensors.", flush=True)
+
+    task_vectors = []
+    for index, path in enumerate(paths, start=1):
+        print(f"Raw task vector pass {index}/{len(paths)}: {path}", flush=True)
+        state = load_state_dict(path, map_location=map_location)
+        task_vectors.append({
+            key: state[key].detach().cpu().float() - pretrained_state[key].detach().cpu().float()
+            for key in keys
+        })
+        del state
+
+    layer_names, layer_to_keys = _group_task_vectors(task_vectors, granularity=granularity)
+    return LayeredTaskVectors(
+        pretrained_state=pretrained_state,
+        finetuned_paths=paths,
+        task_vectors=task_vectors,
+        task_names=task_names,
+        layer_names=layer_names,
+        layer_to_keys=layer_to_keys,
+    )
+
+
+def load_layered_task_vectors(
+    zeroshot_path: Path | str,
+    finetuned_paths: list[Path | str],
+    task_names: list[str],
+    mode: str = "ties",
+    top_k_percent: float = 20,
+    granularity: str = "layer",
+    map_location: str = "cpu",
+) -> LayeredTaskVectors:
+    if mode == "ties":
+        return load_layered_ties_task_vectors(
+            zeroshot_path=zeroshot_path,
+            finetuned_paths=finetuned_paths,
+            task_names=task_names,
+            top_k_percent=top_k_percent,
+            granularity=granularity,
+            map_location=map_location,
+        )
+    if mode == "raw":
+        return load_layered_raw_task_vectors(
+            zeroshot_path=zeroshot_path,
+            finetuned_paths=finetuned_paths,
+            task_names=task_names,
+            top_k_percent=top_k_percent,
+            granularity=granularity,
+            map_location=map_location,
+        )
+    raise ValueError(f"Unknown task vector mode: {mode}. Expected 'ties' or 'raw'.")
 
 
 def initial_coefficients(

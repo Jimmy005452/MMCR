@@ -14,9 +14,9 @@ from mmcr.utils import build_device, seed_everything, write_json
 from .cli import parse_args, validate_args
 from .data import build_reward_batches, build_synthetic_reward_batches
 from .env import RLMMCREnv
-from .merge import load_layered_ties_task_vectors
+from .merge import load_layered_task_vectors
 from .plotting import plot_reward_curves, plot_training_curves
-from .policy import HybridActorCritic
+from .policy import PositiveActorCritic
 from .ppo import collect_rollout, deterministic_policy_result, update_policy
 
 
@@ -91,11 +91,15 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
     head_paths = [resolve_head_path(dataset, checkpoint_root) for dataset in args.datasets]
     require_existing([zeroshot_path, *encoder_paths, *head_paths])
 
-    layered_task_vectors = load_layered_ties_task_vectors(
+    task_vector_mode = getattr(args, "task_vector_mode", "ties")
+    coefficient_granularity = getattr(args, "coefficient_granularity", "layer")
+    layered_task_vectors = load_layered_task_vectors(
         zeroshot_path=zeroshot_path,
         finetuned_paths=encoder_paths,
         task_names=args.datasets,
+        mode=task_vector_mode,
         top_k_percent=args.top_k_percent,
+        granularity=coefficient_granularity,
     )
     reward_mode = getattr(args, "reward_mode", "accuracy_retention")
     if reward_mode in {"synthetic_entropy", "synthetic_proxy"}:
@@ -105,6 +109,9 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
             batch_size=args.reward_batch_size,
             batches_per_dataset=args.reward_batches_per_dataset,
             include_rejected=getattr(args, "include_rejected_synthetic", False),
+            sampling_mode=getattr(args, "reward_sampling_mode", "sequential"),
+            reward_pool_size=getattr(args, "reward_pool_size", 0),
+            seed=getattr(args, "seed", 0),
         )
     else:
         reward_batches = build_reward_batches(
@@ -196,7 +203,7 @@ def mean_reward_stat(rollouts: list[dict], key: str) -> float:
     return sum(float(rollout["infos"][-1]["reward_stats"][key]) for rollout in rollouts) / len(rollouts)
 
 
-def train(args, env: RLMMCREnv, model: HybridActorCritic, optimizer: torch.optim.Optimizer):
+def train(args, env: RLMMCREnv, model: PositiveActorCritic, optimizer: torch.optim.Optimizer):
     best_sample = {"objective": float("-inf"), "mean_retention": float("-inf")}
     update_history = []
     episode_history = []
@@ -248,7 +255,7 @@ def train(args, env: RLMMCREnv, model: HybridActorCritic, optimizer: torch.optim
 
         should_log = episodes_completed % args.log_every == 0 or episodes_completed == args.episodes
         if should_log:
-            deterministic = deterministic_policy_result(env, model, args.gate_threshold)
+            deterministic = deterministic_policy_result(env, model)
             deterministic_retention = deterministic["infos"][-1]["reward_stats"]["mean_retention"]
             history_row.update(
                 deterministic_average=float(deterministic["average"]),
@@ -277,9 +284,9 @@ def train(args, env: RLMMCREnv, model: HybridActorCritic, optimizer: torch.optim
     return best_sample, update_history, episode_history
 
 
-def export_results(args, env: RLMMCREnv, model: HybridActorCritic, best_sample: dict, history: list[dict], episodes: list[dict]):
+def export_results(args, env: RLMMCREnv, model: PositiveActorCritic, best_sample: dict, history: list[dict], episodes: list[dict]):
     output_dir = Path(args.output_dir)
-    final_policy = deterministic_policy_result(env, model, args.gate_threshold)
+    final_policy = deterministic_policy_result(env, model)
     final_coefficients = torch.tensor(final_policy["coefficients"], dtype=torch.float32)
     best_coefficients = torch.tensor(best_sample["coefficients"], dtype=torch.float32)
 
@@ -316,8 +323,9 @@ def export_results(args, env: RLMMCREnv, model: HybridActorCritic, best_sample: 
         "num_models": env.num_models,
         "num_layers": env.num_layers,
         "layer_names": env.layer_names,
-        "action_type": args.action_mode,
+        "action_type": f"{args.merge_granularity}_{args.coefficient_granularity}_ppo_positive_softplus_coefficients",
         "merge_granularity": args.merge_granularity,
+        "coefficient_granularity": args.coefficient_granularity,
         "exported_policy": exported_policy,
         "final_policy": final_policy,
         "best_sample": best_sample,
@@ -357,13 +365,14 @@ def main() -> None:
     print(f"Using device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""))
 
     env = build_environment(args, device)
-    model = HybridActorCritic(
+    model = PositiveActorCritic(
         env.state_dim,
         env.num_models,
         hidden_dim=args.policy_hidden_dim,
         coefficient_mode=args.coefficient_mode,
         coefficient_init=args.coefficient_init,
-        action_mode=args.action_mode,
+        log_std_min=args.log_std_min,
+        log_std_max=args.log_std_max,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
