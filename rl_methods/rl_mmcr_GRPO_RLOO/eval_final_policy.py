@@ -34,7 +34,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k-percent", type=float, default=None)
     parser.add_argument("--task-vector-mode", choices=["ties", "raw"], default=None)
     parser.add_argument("--coefficient-granularity", choices=["layer", "tensor"], default=None)
-    parser.add_argument("--coefficient-mode", default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--gpu", type=int, default=None)
@@ -100,7 +99,6 @@ def build_merged_encoder(
     top_k_percent: float,
     task_vector_mode: str,
     coefficient_granularity: str,
-    coefficient_mode: str,
     coefficients: torch.Tensor,
     device: torch.device,
 ):
@@ -121,7 +119,7 @@ def build_merged_encoder(
     merged_state = ppo_merge.merge_state_with_layer_coefficients(
         layered_task_vectors,
         coefficients,
-        coefficient_mode=coefficient_mode,
+        coefficient_mode="positive",
     )
     encoder = build_image_encoder(arch=arch, pretrained=False)
     encoder.load_state_dict(merged_state)
@@ -195,7 +193,6 @@ def main() -> None:
     top_k_percent = float(args.top_k_percent if args.top_k_percent is not None else config.get("top_k_percent", 20.0))
     task_vector_mode = args.task_vector_mode or config.get("task_vector_mode", "ties")
     coefficient_granularity = args.coefficient_granularity or config.get("coefficient_granularity", "layer")
-    coefficient_mode = args.coefficient_mode or config.get("coefficient_mode", "positive")
     batch_size = int(args.batch_size if args.batch_size is not None else config.get("reward_batch_size", 64))
     num_workers = int(args.num_workers if args.num_workers is not None else config.get("num_workers", 4))
     gpu = int(args.gpu if args.gpu is not None else config.get("gpu", 0))
@@ -216,7 +213,6 @@ def main() -> None:
         top_k_percent=top_k_percent,
         task_vector_mode=task_vector_mode,
         coefficient_granularity=coefficient_granularity,
-        coefficient_mode=coefficient_mode,
         coefficients=coefficients,
         device=device,
     )
@@ -245,7 +241,7 @@ def main() -> None:
         "top_k_percent": top_k_percent,
         "task_vector_mode": task_vector_mode,
         "coefficient_granularity": coefficient_granularity,
-        "coefficient_mode": coefficient_mode,
+        "coefficient_mode": "positive",
         "coefficient_shape": list(expanded_coefficients.shape),
         "results": results,
     }

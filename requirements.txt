@@ -1,5 +1,3 @@
-# torch
-# torchvision
 timm
 tqdm
 scipy

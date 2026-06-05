@@ -29,24 +29,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-root", default=None)
     parser.add_argument("--zeroshot", default=None)
     parser.add_argument("--data-root", default=None)
-    parser.add_argument("--synthesis-root", default=None)
     parser.add_argument("--arch", default=None)
     parser.add_argument("--top-k-percent", type=float, default=None)
     parser.add_argument("--task-vector-mode", choices=["ties", "raw"], default=None)
     parser.add_argument("--merge-granularity", choices=["global", "layer"], default=None)
     parser.add_argument("--coefficient-granularity", choices=["layer", "tensor"], default=None)
     parser.add_argument("--state-mode", choices=["minimal", "full_coefficients"], default=None)
-    parser.add_argument("--coefficient-mode", choices=["positive"], default=None)
     parser.add_argument("--coefficient-init", type=float, default=None)
-    parser.add_argument("--reward-mode", choices=["accuracy_retention", "entropy", "synthetic_entropy", "synthetic_proxy"], default=None)
     parser.add_argument("--reward-split", choices=["val", "test"], default=None)
     parser.add_argument("--reward-batch-size", type=int, default=None)
     parser.add_argument("--reward-batches-per-dataset", type=int, default=None)
     parser.add_argument("--reward-sampling-mode", choices=["sequential", "stratified_pool"], default=None)
     parser.add_argument("--reward-pool-size", type=int, default=None)
     parser.add_argument("--reward-pool-position", type=int, default=0, help="Reward pool window used while replaying the transferred policy.")
-    parser.add_argument("--source-baseline-json", default=None, help="Optional target-dataset source baseline cache. Not inherited from source policy config.")
-    parser.add_argument("--include-rejected-synthetic", action="store_true")
     parser.add_argument("--eval-batch-size", type=int, default=None, help="Batch size for final full-dataset accuracy evaluation.")
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--gpu", type=int, default=None)
@@ -88,7 +83,6 @@ def build_target_args(args: argparse.Namespace, source_config: dict) -> SimpleNa
         checkpoint_root=checkpoint_root,
         zeroshot=args.zeroshot if args.zeroshot is not None else source_config.get("zeroshot"),
         data_root=pick(args, source_config, "data_root", "data"),
-        synthesis_root=pick(args, source_config, "synthesis_root", "synthesis_data/generated"),
         reward_split=pick(args, source_config, "reward_split", "val"),
         reward_batch_size=int(pick(args, source_config, "reward_batch_size", 64)),
         reward_batches_per_dataset=int(pick(args, source_config, "reward_batches_per_dataset", 1)),
@@ -97,28 +91,20 @@ def build_target_args(args: argparse.Namespace, source_config: dict) -> SimpleNa
         top_k_percent=float(pick(args, source_config, "top_k_percent", 20.0)),
         task_vector_mode=pick(args, source_config, "task_vector_mode", "ties"),
         no_download=bool(args.no_download or source_config.get("no_download", False)),
-        source_baseline_json=args.source_baseline_json,
-        include_rejected_synthetic=bool(args.include_rejected_synthetic or source_config.get("include_rejected_synthetic", False)),
         arch=pick(args, source_config, "arch", DEFAULT_ARCH),
         policy_hidden_dim=int(source_config.get("policy_hidden_dim", 128)),
         merge_granularity=pick(args, source_config, "merge_granularity", "layer"),
         coefficient_granularity=pick(args, source_config, "coefficient_granularity", "layer"),
         state_mode=pick(args, source_config, "state_mode", "minimal"),
-        coefficient_mode=pick(args, source_config, "coefficient_mode", "positive"),
+        coefficient_mode="positive",
         coefficient_init=float(pick(args, source_config, "coefficient_init", 0.3)),
         log_std_min=float(source_config.get("log_std_min", -5.0)),
         log_std_max=float(source_config.get("log_std_max", 1.0)),
         terminal_bonus=float(source_config.get("terminal_bonus", 1.0)),
         reward_scale=float(source_config.get("reward_scale", 1.0)),
-        reward_mode=pick(args, source_config, "reward_mode", "accuracy_retention"),
-        kl_weight=float(source_config.get("kl_weight", 1.0)),
-        agreement_weight=float(source_config.get("agreement_weight", 0.5)),
-        entropy_weight=float(source_config.get("entropy_weight", 0.1)),
-        activation_reward_coef=0.0,
+        reward_mode="entropy",
         step_reward_coef=float(source_config.get("step_reward_coef", 0.25)),
-        accuracy_imbalance_coef=float(source_config.get("accuracy_imbalance_coef", 0.5)),
-        retention_worst_coef=float(source_config.get("retention_worst_coef", 0.5)),
-        retention_drop_coef=float(source_config.get("retention_drop_coef", 1.0)),
+        score_imbalance_coef=float(source_config.get("score_imbalance_coef", 0.5)),
         reward_eval_interval=int(source_config.get("reward_eval_interval", 1)),
         episode_reward_only=bool(source_config.get("episode_reward_only", False)),
         output_dir=str(Path(args.output_json).parent),

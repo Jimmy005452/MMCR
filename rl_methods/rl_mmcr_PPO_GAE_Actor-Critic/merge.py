@@ -189,20 +189,15 @@ def initial_coefficients(
     coefficient_mode: str,
     coefficient_init: float,
 ) -> torch.Tensor:
-    if coefficient_mode == "softmax":
-        value = 1.0 / max(num_models, 1)
-        return torch.full((num_layers, num_models), value, dtype=torch.float32)
+    if coefficient_mode != "positive":
+        raise ValueError("Only positive coefficients are supported.")
     return torch.full((num_layers, num_models), coefficient_init, dtype=torch.float32)
 
 
 def normalize_coefficients(coefficients: torch.Tensor, coefficient_mode: str) -> torch.Tensor:
-    if coefficient_mode == "positive":
-        return coefficients.clamp(min=0.0)
-    if coefficient_mode != "softmax":
-        return coefficients
-    if coefficients.ndim == 1:
-        return coefficients / coefficients.sum().clamp(min=1e-8)
-    return coefficients / coefficients.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    if coefficient_mode != "positive":
+        raise ValueError("Only positive coefficients are supported.")
+    return coefficients.clamp(min=0.0)
 
 
 def flatten_layer(task_vector: dict[str, torch.Tensor], keys: list[str]) -> torch.Tensor:

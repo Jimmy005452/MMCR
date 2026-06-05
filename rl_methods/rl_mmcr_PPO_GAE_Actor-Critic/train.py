@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import json
-
 import torch
 from tqdm import tqdm
 
@@ -12,7 +10,7 @@ from mmcr.evaluation import evaluate_encoder, resolve_head_path
 from mmcr.models import build_image_encoder
 from mmcr.utils import build_device, seed_everything, write_json
 from .cli import parse_args, validate_args
-from .data import build_reward_batches, build_synthetic_reward_batches
+from .data import build_reward_batches
 from .env import RLMMCREnv
 from .merge import load_layered_task_vectors
 from .plotting import plot_reward_curves, plot_training_curves
@@ -30,44 +28,6 @@ def resolve_source_encoder_path(checkpoint_root: Path, dataset: str) -> Path:
 
 
 
-def load_source_baseline_scores(path: str | None, datasets: list[str]) -> dict[str, float] | None:
-    if path is None:
-        return None
-
-    baseline_path = Path(path)
-    with baseline_path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
-
-    if isinstance(payload.get("source_baseline_scores"), dict):
-        raw_scores = payload["source_baseline_scores"]
-    elif isinstance(payload.get("results"), dict):
-        raw_scores = {
-            dataset: row["acc"]
-            for dataset, row in payload["results"].items()
-            if dataset != "average" and isinstance(row, dict) and "acc" in row
-        }
-    else:
-        raw_scores = {
-            dataset: row["acc"]
-            for dataset, row in payload.items()
-            if dataset != "average" and isinstance(row, dict) and "acc" in row
-        }
-
-    scores = {}
-    missing = []
-    for dataset in datasets:
-        normalized = normalize_dataset_key(dataset)
-        if dataset in raw_scores:
-            scores[dataset] = float(raw_scores[dataset])
-        elif normalized in raw_scores:
-            scores[dataset] = float(raw_scores[normalized])
-        else:
-            missing.append(dataset)
-    if missing:
-        raise ValueError(f"{baseline_path} is missing source baseline dataset(s): {', '.join(missing)}")
-
-    print(f"Loaded source baseline scores from {baseline_path}")
-    return scores
 
 def require_existing(paths: list[Path]) -> None:
     missing = [path for path in paths if not path.exists()]
@@ -75,13 +35,13 @@ def require_existing(paths: list[Path]) -> None:
         raise FileNotFoundError("Missing required checkpoint(s): " + ", ".join(str(path) for path in missing))
 
 
-def format_retention(value: float) -> str:
-    return f"{value:.4f}x"
+def format_score(value: float) -> str:
+    return f"{value:.4f}"
 
 
 def format_scores(scores: dict[str, float], datasets: list[str]) -> str:
-    parts = [f"{dataset}={scores[dataset] * 100:.1f}%" for dataset in datasets if dataset in scores]
-    return " acc={" + ", ".join(parts) + "}" if parts else ""
+    parts = [f"{dataset}={scores[dataset]:.4f}" for dataset in datasets if dataset in scores]
+    return " score={" + ", ".join(parts) + "}" if parts else ""
 
 
 def build_environment(args, device: torch.device) -> RLMMCREnv:
@@ -101,38 +61,24 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
         top_k_percent=args.top_k_percent,
         granularity=coefficient_granularity,
     )
-    reward_mode = getattr(args, "reward_mode", "accuracy_retention")
-    if reward_mode in {"synthetic_entropy", "synthetic_proxy"}:
-        reward_batches = build_synthetic_reward_batches(
-            datasets=args.datasets,
-            synthesis_root=getattr(args, "synthesis_root", "synthesis_data/generated"),
-            batch_size=args.reward_batch_size,
-            batches_per_dataset=args.reward_batches_per_dataset,
-            include_rejected=getattr(args, "include_rejected_synthetic", False),
-            sampling_mode=getattr(args, "reward_sampling_mode", "sequential"),
-            reward_pool_size=getattr(args, "reward_pool_size", 0),
-            seed=getattr(args, "seed", 0),
-        )
-    else:
-        reward_batches = build_reward_batches(
-            datasets=args.datasets,
-            data_root=args.data_root,
-            arch=args.arch,
-            batch_size=args.reward_batch_size,
-            batches_per_dataset=args.reward_batches_per_dataset,
-            num_workers=args.num_workers,
-            split=args.reward_split,
-            download=not args.no_download,
-            sampling_mode=getattr(args, "reward_sampling_mode", "sequential"),
-            reward_pool_size=getattr(args, "reward_pool_size", 0),
-            seed=getattr(args, "seed", 0),
-        )
+    reward_mode = getattr(args, "reward_mode", "entropy")
+    reward_batches = build_reward_batches(
+        datasets=args.datasets,
+        data_root=args.data_root,
+        arch=args.arch,
+        batch_size=args.reward_batch_size,
+        batches_per_dataset=args.reward_batches_per_dataset,
+        num_workers=args.num_workers,
+        split=args.reward_split,
+        download=not args.no_download,
+        sampling_mode=getattr(args, "reward_sampling_mode", "sequential"),
+        reward_pool_size=getattr(args, "reward_pool_size", 0),
+        seed=getattr(args, "seed", 0),
+    )
     heads = {
         dataset: load_head(head_path, device=device)
         for dataset, head_path in zip(args.datasets, head_paths)
     }
-
-    source_baseline_scores = load_source_baseline_scores(args.source_baseline_json, args.datasets)
 
     return RLMMCREnv(
         encoder=build_image_encoder(arch=args.arch, pretrained=False).to(device),
@@ -144,22 +90,15 @@ def build_environment(args, device: torch.device) -> RLMMCREnv:
         terminal_bonus=args.terminal_bonus,
         reward_scale=args.reward_scale,
         step_reward_coef=args.step_reward_coef,
-        accuracy_imbalance_coef=args.accuracy_imbalance_coef,
-        retention_worst_coef=args.retention_worst_coef,
-        retention_drop_coef=args.retention_drop_coef,
+        score_imbalance_coef=args.score_imbalance_coef,
         reward_eval_interval=args.reward_eval_interval,
         episode_reward_only=args.episode_reward_only,
         coefficient_mode=args.coefficient_mode,
         coefficient_init=args.coefficient_init,
         cache_task_vectors_device=args.cache_task_vectors_device,
         merge_granularity=args.merge_granularity,
-        source_baseline_scores=source_baseline_scores,
-        activation_reward_coef=args.activation_reward_coef,
         state_mode=args.state_mode,
         reward_mode=reward_mode,
-        kl_weight=getattr(args, "kl_weight", 1.0),
-        agreement_weight=getattr(args, "agreement_weight", 0.5),
-        entropy_weight=getattr(args, "entropy_weight", 0.1),
         batched_reward_eval=getattr(args, "batched_reward_eval", False),
         batched_reward_max_samples=getattr(args, "batched_reward_max_samples", 128),
     )
@@ -176,19 +115,18 @@ def summarize_rollout(rollout: dict, episode: int, best_sample: dict) -> dict:
             selected=rollout["selected"],
             coefficients=rollout["coefficients"],
             objective=objective,
-            mean_accuracy=float(terminal["average"]),
-            mean_retention=float(reward_stats["mean_retention"]),
+            mean_score=float(reward_stats["mean_score"]),
             scores=terminal["scores"],
             reward_stats=reward_stats,
         )
 
     return {
         "episode": episode,
-        "sample_average": float(terminal["average"]),
-        "sample_retention": float(reward_stats["mean_retention"]),
+        "sample_average_score": float(terminal["average"]),
+        "sample_score": float(reward_stats["mean_score"]),
         "sample_objective": objective,
         "best_objective": float(best_sample["objective"]),
-        "best_retention": float(best_sample["mean_retention"]),
+        "best_score": float(best_sample["mean_score"]),
         "reward_sum": reward_sum,
         "final_scores": terminal["scores"],
         "reward_stats": reward_stats,
@@ -204,7 +142,7 @@ def mean_reward_stat(rollouts: list[dict], key: str) -> float:
 
 
 def train(args, env: RLMMCREnv, model: PositiveActorCritic, optimizer: torch.optim.Optimizer):
-    best_sample = {"objective": float("-inf"), "mean_retention": float("-inf")}
+    best_sample = {"objective": float("-inf"), "mean_score": float("-inf")}
     update_history = []
     episode_history = []
     episodes_completed = 0
@@ -240,14 +178,14 @@ def train(args, env: RLMMCREnv, model: PositiveActorCritic, optimizer: torch.opt
         history_row = {
             "update": len(update_history) + 1,
             "episodes_completed": episodes_completed,
-            "sample_average": mean_terminal(rollouts, "average"),
-            "sample_retention": mean_reward_stat(rollouts, "mean_retention"),
+            "sample_average_score": mean_terminal(rollouts, "average"),
+            "sample_score": mean_reward_stat(rollouts, "mean_score"),
             "sample_objective": mean_terminal(rollouts, "objective"),
             "best_objective": float(best_sample["objective"]),
-            "best_retention": float(best_sample["mean_retention"]),
+            "best_score": float(best_sample["mean_score"]),
             "reward_sum": sum(sum(rollout["rewards"]) for rollout in rollouts) / len(rollouts),
-            "deterministic_average": None,
-            "deterministic_retention": None,
+            "deterministic_average_score": None,
+            "deterministic_score": None,
             "deterministic_objective": None,
             "deterministic_scores": None,
             **stats.__dict__,
@@ -256,25 +194,25 @@ def train(args, env: RLMMCREnv, model: PositiveActorCritic, optimizer: torch.opt
         should_log = episodes_completed % args.log_every == 0 or episodes_completed == args.episodes
         if should_log:
             deterministic = deterministic_policy_result(env, model)
-            deterministic_retention = deterministic["infos"][-1]["reward_stats"]["mean_retention"]
+            deterministic_score = deterministic["infos"][-1]["reward_stats"]["mean_score"]
             history_row.update(
-                deterministic_average=float(deterministic["average"]),
-                deterministic_retention=float(deterministic_retention),
+                deterministic_average_score=float(deterministic["average"]),
+                deterministic_score=float(deterministic_score),
                 deterministic_objective=float(deterministic["objective"]),
                 deterministic_scores=deterministic["scores"],
             )
             progress.write(
-                f"episodes={episodes_completed} retention sample={format_retention(history_row['sample_retention'])} "
-                f"best={format_retention(best_sample['mean_retention'])} "
-                f"deterministic={format_retention(deterministic_retention)} "
+                f"episodes={episodes_completed} score sample={format_score(history_row['sample_score'])} "
+                f"best={format_score(best_sample['mean_score'])} "
+                f"deterministic={format_score(deterministic_score)} "
                 f"{format_scores(rollouts[-1]['infos'][-1]['scores'], args.datasets)} "
                 f"reward={history_row['reward_sum']:.4f} loss={stats.loss:.4f} kl={stats.approx_kl:.4f}"
             )
 
         update_history.append(history_row)
         progress.set_postfix(
-            sample=format_retention(history_row["sample_retention"]),
-            best=format_retention(best_sample["mean_retention"]),
+            sample=format_score(history_row["sample_score"]),
+            best=format_score(best_sample["mean_score"]),
             reward=f"{history_row['reward_sum']:.4f}",
             loss=f"{stats.loss:.4f}",
             kl=f"{stats.approx_kl:.4f}",
@@ -294,8 +232,7 @@ def export_results(args, env: RLMMCREnv, model: PositiveActorCritic, best_sample
         export_coefficients = best_coefficients
         exported_policy = {"type": "best_sample", **{key: best_sample[key] for key in (
             "objective",
-            "mean_accuracy",
-            "mean_retention",
+            "mean_score",
             "scores",
             "reward_stats",
         )}}
@@ -305,8 +242,7 @@ def export_results(args, env: RLMMCREnv, model: PositiveActorCritic, best_sample
         exported_policy = {
             "type": "final_deterministic",
             "objective": float(final_policy["objective"]),
-            "mean_accuracy": float(final_policy["average"]),
-            "mean_retention": float(terminal_stats["mean_retention"]),
+            "mean_score": float(terminal_stats["mean_score"]),
             "scores": final_policy["scores"],
             "reward_stats": terminal_stats,
         }
@@ -318,7 +254,6 @@ def export_results(args, env: RLMMCREnv, model: PositiveActorCritic, best_sample
 
     payload = {
         "config": vars(args),
-        "source_baseline_scores": env.source_baseline_scores,
         "state_dim": env.state_dim,
         "num_models": env.num_models,
         "num_layers": env.num_layers,

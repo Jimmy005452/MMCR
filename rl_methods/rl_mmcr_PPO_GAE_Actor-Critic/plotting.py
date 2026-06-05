@@ -26,18 +26,18 @@ def plot_training_curves(
 
     if episode_history:
         episodes = [row["episode"] for row in episode_history]
-        axes[0].plot(episodes, [row["sample_retention"] for row in episode_history], label="Sample Retention")
-        axes[0].plot(episodes, [row["best_retention"] for row in episode_history], label="Best Retention")
+        axes[0].plot(episodes, [row["sample_score"] for row in episode_history], label="Sample Score")
+        axes[0].plot(episodes, [row["best_score"] for row in episode_history], label="Best Score")
 
-    deterministic = [row for row in update_history if row["deterministic_retention"] is not None]
+    deterministic = [row for row in update_history if row.get("deterministic_score") is not None]
     if deterministic:
         axes[0].plot(
             [row["episodes_completed"] for row in deterministic],
-            [row["deterministic_retention"] for row in deterministic],
-            label="Deterministic Retention",
+            [row["deterministic_score"] for row in deterministic],
+            label="Deterministic Score",
         )
 
-    axes[0].set(title="Retention", xlabel="Episode", ylabel="Retention ratio")
+    axes[0].set(title="Objective Score", xlabel="Episode", ylabel="Score")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 

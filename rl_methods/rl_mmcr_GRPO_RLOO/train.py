@@ -18,13 +18,13 @@ plotting = importlib.import_module("rl_methods.rl_mmcr_PPO_GAE_Actor-Critic.plot
 coefficients_to_dict = importlib.import_module("rl_methods.rl_mmcr_PPO_GAE_Actor-Critic.merge").coefficients_to_dict
 
 
-def format_retention(value: float) -> str:
-    return f"{value:.4f}x"
+def format_score(value: float) -> str:
+    return f"{value:.4f}"
 
 
 def format_scores(scores: dict[str, float], datasets: list[str]) -> str:
-    parts = [f"{dataset}={scores[dataset] * 100:.1f}%" for dataset in datasets if dataset in scores]
-    return " acc={" + ", ".join(parts) + "}" if parts else ""
+    parts = [f"{dataset}={scores[dataset]:.4f}" for dataset in datasets if dataset in scores]
+    return " score={" + ", ".join(parts) + "}" if parts else ""
 
 
 def same_torch_device(left: torch.device, right: torch.device) -> bool:
@@ -285,13 +285,13 @@ def collect_global_group(env, policy: PositiveSoftplusPolicy, group_size: int) -
     results = []
     rewards = []
     objectives = []
-    retentions = []
+    score_values = []
     for action in actions:
         result = evaluate_action(env, action.detach())
         results.append(result)
         rewards.append(result["reward"])
         objectives.append(result["objective"])
-        retentions.append(result["reward_stats"]["mean_retention"])
+        score_values.append(result["reward_stats"]["mean_score"])
 
     return {
         "states": states.detach(),
@@ -303,7 +303,7 @@ def collect_global_group(env, policy: PositiveSoftplusPolicy, group_size: int) -
         "entropies": entropies.detach(),
         "rewards": torch.tensor(rewards, dtype=torch.float32, device=env.device),
         "objectives": objectives,
-        "retentions": retentions,
+        "score_values": score_values,
         "results": results,
     }
 
@@ -311,7 +311,7 @@ def collect_global_group(env, policy: PositiveSoftplusPolicy, group_size: int) -
 def _pack_layer_trajectories(env, trajectories: list[dict]) -> dict:
     rewards = torch.tensor([trajectory["reward"] for trajectory in trajectories], dtype=torch.float32, device=env.device)
     objectives = [trajectory["objective"] for trajectory in trajectories]
-    retentions = [trajectory["reward_stats"]["mean_retention"] for trajectory in trajectories]
+    score_values = [trajectory["reward_stats"]["mean_score"] for trajectory in trajectories]
 
     def to_train_device(name: str) -> torch.Tensor:
         return torch.cat([trajectory[name].to(env.device, non_blocking=True) for trajectory in trajectories], dim=0).detach()
@@ -327,7 +327,7 @@ def _pack_layer_trajectories(env, trajectories: list[dict]) -> dict:
         "trajectory_lengths": [int(trajectory["states"].shape[0]) for trajectory in trajectories],
         "rewards": rewards,
         "objectives": objectives,
-        "retentions": retentions,
+        "score_values": score_values,
         "results": trajectories,
     }
 
@@ -421,7 +421,7 @@ def summarize_best(group: dict, best_sample: dict, env, args) -> dict:
         result["selection_rank"] = int(rank)
         result["selection_group_index"] = int(best_index)
         result["train_objective"] = float(train_result["objective"])
-        result["train_mean_retention"] = float(train_result["reward_stats"]["mean_retention"])
+        result["train_mean_score"] = float(train_result["reward_stats"]["mean_score"])
         result["train_scores"] = train_result["scores"]
         result["train_reward_stats"] = train_result["reward_stats"]
         result["selection_reward_pool_position"] = fixed_selection_position(args)
@@ -433,12 +433,11 @@ def summarize_best(group: dict, best_sample: dict, env, args) -> dict:
             coefficients=result["coefficients"],
             expanded_coefficients=result["expanded_coefficients"],
             objective=float(result["objective"]),
-            mean_accuracy=float(result["average"]),
-            mean_retention=float(result["reward_stats"]["mean_retention"]),
+            mean_score=float(result["reward_stats"]["mean_score"]),
             scores=result["scores"],
             reward_stats=result["reward_stats"],
             train_objective=result["train_objective"],
-            train_mean_retention=result["train_mean_retention"],
+            train_mean_score=result["train_mean_score"],
             train_scores=result["train_scores"],
             train_reward_stats=result["train_reward_stats"],
             selection_reward_pool_position=result["selection_reward_pool_position"],
@@ -449,7 +448,7 @@ def summarize_best(group: dict, best_sample: dict, env, args) -> dict:
 
 
 def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Optimizer, trajectory_contexts: list[dict] | None = None):
-    best_sample = {"objective": float("-inf"), "mean_retention": float("-inf")}
+    best_sample = {"objective": float("-inf"), "mean_score": float("-inf")}
     best_policy_state = None
     update_history = []
     episode_history = []
@@ -519,11 +518,11 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
 
         episode_history.append({
             "episode": iteration,
-            "sample_average": float(group_best["average"]),
-            "sample_retention": float(group_best["reward_stats"]["mean_retention"]),
+            "sample_average_score": float(group_best["average"]),
+            "sample_score": float(group_best["reward_stats"]["mean_score"]),
             "sample_objective": float(group_best["objective"]),
             "best_objective": float(best_sample["objective"]),
-            "best_retention": float(best_sample["mean_retention"]),
+            "best_score": float(best_sample["mean_score"]),
             "reward_sum": float(group["rewards"].mean().item()),
             "final_scores": group_best["scores"],
             "reward_stats": group_best["reward_stats"],
@@ -540,16 +539,16 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
             "clip_eps_low": float(args.clip_eps if args.clip_eps_low is None else args.clip_eps_low),
             "clip_eps_high": float(args.clip_eps if args.clip_eps_high is None else args.clip_eps_high),
             "group_objective_mean": float(sum(group["objectives"]) / len(group["objectives"])),
-            "group_retention_mean": float(sum(group["retentions"]) / len(group["retentions"])),
+            "group_score_mean": float(sum(group["score_values"]) / len(group["score_values"])),
             "trajectory_lengths": group.get("trajectory_lengths", [1 for _ in group["results"]]),
-            "sample_average": float(group_best["average"]),
-            "sample_retention": float(group_best["reward_stats"]["mean_retention"]),
+            "sample_average_score": float(group_best["average"]),
+            "sample_score": float(group_best["reward_stats"]["mean_score"]),
             "sample_objective": float(group_best["objective"]),
             "best_objective": float(best_sample["objective"]),
-            "best_retention": float(best_sample["mean_retention"]),
+            "best_score": float(best_sample["mean_score"]),
             "reward_sum": float(group["rewards"].mean().item()),
-            "deterministic_average": None,
-            "deterministic_retention": None,
+            "deterministic_average_score": None,
+            "deterministic_score": None,
             "deterministic_objective": None,
             "deterministic_scores": None,
             "value_loss": None,
@@ -560,17 +559,17 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
         should_log = (iteration + 1) % args.log_every == 0 or iteration + 1 == args.iterations
         if should_log:
             deterministic = deterministic_selection_result(env, args, policy)
-            deterministic_retention = deterministic["infos"][-1]["reward_stats"]["mean_retention"]
+            deterministic_score = deterministic["infos"][-1]["reward_stats"]["mean_score"]
             history_row.update(
-                deterministic_average=float(deterministic["average"]),
-                deterministic_retention=float(deterministic_retention),
+                deterministic_average_score=float(deterministic["average"]),
+                deterministic_score=float(deterministic_score),
                 deterministic_objective=float(deterministic["objective"]),
                 deterministic_scores=deterministic["scores"],
             )
             progress.write(
-                f"iters={iteration + 1} retention group_best={format_retention(history_row['sample_retention'])} "
-                f"best={format_retention(best_sample['mean_retention'])} "
-                f"deterministic={format_retention(deterministic_retention)} "
+                f"iters={iteration + 1} score group_best={format_score(history_row['sample_score'])} "
+                f"best={format_score(best_sample['mean_score'])} "
+                f"deterministic={format_score(deterministic_score)} "
                 f"{format_scores(group_best['scores'], args.datasets)} "
                 f"reward_mean={history_row['group_reward_mean']:.4f} loss={stats.loss:.4f} kl={stats.approx_kl:.4f}"
             )
@@ -578,8 +577,8 @@ def train(args, env, policy: PositiveSoftplusPolicy, optimizer: torch.optim.Opti
         update_history.append(history_row)
         progress.update(1)
         progress.set_postfix(
-            group_best=format_retention(history_row["sample_retention"]),
-            best=format_retention(best_sample["mean_retention"]),
+            group_best=format_score(history_row["sample_score"]),
+            best=format_score(best_sample["mean_score"]),
             reward=f"{history_row['group_reward_mean']:.4f}",
             kl=f"{stats.approx_kl:.4f}",
         )
@@ -621,8 +620,7 @@ def export_results(
         export_coefficients = best_coefficients
         exported_policy = {"type": "best_group_sample", **{key: best_sample[key] for key in (
             "objective",
-            "mean_accuracy",
-            "mean_retention",
+            "mean_score",
             "scores",
             "reward_stats",
         )}}
@@ -632,8 +630,7 @@ def export_results(
         exported_policy = {
             "type": "final_deterministic",
             "objective": float(final_policy["objective"]),
-            "mean_accuracy": float(final_policy["average"]),
-            "mean_retention": float(terminal_stats["mean_retention"]),
+            "mean_score": float(terminal_stats["mean_score"]),
             "scores": final_policy["scores"],
             "reward_stats": terminal_stats,
         }
@@ -657,8 +654,7 @@ def export_results(
             "coefficients": best_sample["coefficients"],
             "expanded_coefficients": best_sample["expanded_coefficients"],
             "objective": float(best_sample["objective"]),
-            "mean_accuracy": float(best_sample["mean_accuracy"]),
-            "mean_retention": float(best_sample["mean_retention"]),
+            "mean_score": float(best_sample["mean_score"]),
             "scores": best_sample["scores"],
             "reward_stats": best_sample["reward_stats"],
             "policy_iteration": best_sample.get("policy_iteration"),
@@ -675,8 +671,7 @@ def export_results(
             "coefficients": final_policy["coefficients"],
             "expanded_coefficients": final_policy["expanded_coefficients"],
             "objective": float(final_policy["objective"]),
-            "mean_accuracy": float(final_policy["average"]),
-            "mean_retention": float(final_terminal_stats["mean_retention"]),
+            "mean_score": float(final_terminal_stats["mean_score"]),
             "scores": final_policy["scores"],
             "reward_stats": final_terminal_stats,
             "config": vars(args),
@@ -697,7 +692,6 @@ def export_results(
 
     payload = {
         "config": vars(args),
-        "source_baseline_scores": env.source_baseline_scores,
         "state_dim": env.state_dim,
         "num_models": env.num_models,
         "num_layers": env.num_layers,
