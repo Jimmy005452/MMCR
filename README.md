@@ -232,7 +232,7 @@ hf download jimmy0214/RL-final-MMCR-heads \
   --local-dir checkpoints
 ```
 
-We also provide the code for training the heads. For more details, please refer to the **Generate Source Heads by Fine-tuning** section in `CLI.md`.
+We also provide the code for training the heads. For more details, please refer to the [Generate Source Heads by Fine-tuning](CLI.md#generate-source-heads-by-fine-tuning) section in `CLI.md`.
 
 ### Expected Checkpoint Layout
 
@@ -276,7 +276,7 @@ python -m rl_methods.source_baselines \
 
 ## Model Merging Baselines
 
-For the commands used to run model merging baselines, please refer to the **Model Merging Baselines** section in `CLI.md`.
+For the commands used to run model merging baselines, please refer to the [Model Merging Baselines](CLI.md#model-merging-baselines) section in `CLI.md`.
 
 We provide instructions for running the following five baseline methods:
 
@@ -364,7 +364,7 @@ training_curves.png # score/loss/KL/entropy curves
 reward_curves.png   # per-episode reward curve
 ```
 
-For experiments with other settings, please refer to the **RL-based Model Merging** section in `CLI.md`. It includes commands for the following settings:
+For experiments with other settings, please refer to the [RL-based Model Merging](CLI.md#rl-based-model-merging) section in `CLI.md`. It includes commands for the following settings:
 
 * GRPO on Different Numbers of Datasets
 * GRPO with Raw Task Vectors (TIES is used by default)
@@ -384,7 +384,7 @@ The full workflow includes three steps:
 2. Apply the saved policy checkpoint to a new target dataset combination.
 3. Evaluate the transferred merged model.
 
-For detailed commands and examples, please refer to the **Policy Transfer** section in `CLI.md`.
+For detailed commands and examples, please refer to the [Policy Transfer](CLI.md#policy-transfer) section in `CLI.md`.
 
 ## Evaluate Any Merged Encoder
 
@@ -404,4 +404,4 @@ python eval.py \
   --results-txt results/eval_custom_encoder.txt
 ```
 
-For additional evaluation options, including automatic dataset inference and comparison against cached source baselines, please refer to the **Evaluate Any Merged Encoder** section in `CLI.md`.
+For additional evaluation options, including automatic dataset inference and comparison against cached source baselines, please refer to the [Evaluate Any Merged Encoder](CLI.md#evaluate-any-merged-encoder) section in `CLI.md`.
