@@ -6,5 +6,3 @@ scipy
 huggingface_hub
 safetensors
 matplotlib
-
-stable-baselines3
