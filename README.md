@@ -1,12 +1,29 @@
 # MMCR: Sequential Layer-wise Model Merging via Reinforcement Learning
 
-MMCR learns sequential layer-wise coefficients for task-vector based Vision Transformer model merging. The project supports standard model-merging baselines and reinforcement-learning-based merging with GRPO/RLOO, PPO-GAE, and GRPO-style variants such as GSPO-like, Dr.GRPO-like, and DAPO-lite.
+MMCR is a reinforcement-learning-based framework for task-vector model merging on Vision Transformer encoders. Instead of using a single global merging coefficient, MMCR learns sequential non-negative layer-wise coefficients over TIES-selected task vectors, allowing each transformer layer to adaptively control how much information is merged from each source task.
 
-The default setting uses TIES-selected task vectors as the merge basis, then learns non-negative layer-wise coefficients with an entropy-based reward. Pretrained source encoders can be converted from Hugging Face checkpoints, and dataset-specific heads can either be downloaded or generated with the included source-model fine-tuning utility.
+The default setting uses CLIP ViT-L/14 source encoders across eight visual recognition datasets: SUN397, Stanford Cars, RESISC45, EuroSAT, SVHN, GTSRB, MNIST, and DTD. MMCR optimizes the merging policy with an entropy-based reward and supports GRPO/RLOO, PPO-GAE, and GRPO-style variants including GSPO-like, Dr.GRPO-like, and DAPO-lite.
+
+Compared with strong task-vector merging baselines, MMCR achieves the best average accuracy in the eight-dataset setting, improving the average accuracy over TIES and AdaMerging while maintaining strong per-dataset performance.
+
+For a visual overview of the motivation, method, experimental setup, results, runtime analysis, and ablation studies, see the [project page](https://fangfangirl.github.io/RL_final/).
+
+## Main Results
+
+| Method | SUN397 | Cars | RESISC45 | EuroSAT | SVHN | GTSRB | MNIST | DTD | Avg. |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| TIES | 76.11 | 83.93 | 83.65 | 80.66 | 84.70 | 89.14 | 89.29 | 65.53 | 81.63 |
+| AdaMerging-300 | 78.20 | 85.56 | 87.67 | 83.50 | 68.45 | 86.81 | 61.74 | 70.96 | 77.86 |
+| AdaMerging-500 | 78.71 | 87.58 | **90.21** | **88.14** | 88.13 | 89.37 | 91.45 | 72.87 | 85.81 |
+| **MMCR (ours)** | 77.57 | **89.11** | 89.06 | 85.72 | **90.65** | **89.96** | **92.54** | **76.64** | **86.41** |
+
+The checkpoint corresponding to the **86.41 average accuracy** result is available on Hugging Face: [RL-final-MMCR-best](https://huggingface.co/jimmy0214/RL-final-MMCR-best/tree/main)
 
 ## Overview
 
-The workflow is:
+MMCR formulates layer-wise task-vector merging as a sequential coefficient-learning problem. Given TIES-selected task vectors, the policy predicts non-negative coefficients for each transformer layer and optimizes the merged encoder with an entropy-based reward.
+
+The full workflow is:
 
 1. Prepare datasets: download the five torchvision-compatible datasets automatically, then download the prepared SUN397, Stanford Cars, and RESISC45 mirror.
 2. Prepare checkpoints: create the zeroshot encoder, convert pretrained source encoders, and download or generate dataset heads.
@@ -21,7 +38,7 @@ The workflow is:
 - Python 3.11+
 - GPU recommended (CUDA supported)
 
-This project was developed on two RTX3090.
+The main experiments were developed and tested on two NVIDIA RTX 3090 GPUs.
 
 For running this project on your local machine, follow the steps below.
 
@@ -31,7 +48,9 @@ For running this project on your local machine, follow the steps below.
 git clone https://github.com/Jimmy005452/MMCR.git
 cd MMCR
 ```
-### Step1: Using Conda (Recommended do)
+### Step1: Create a Conda Environment
+
+Conda is recommended for dependency isolation.
 
 ```bash
 # Create a conda environment
