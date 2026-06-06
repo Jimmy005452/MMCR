@@ -97,12 +97,10 @@ python eval.py \
 
 ```bash
 python -m model_merging.dare_merge \
-  --merge-method ties \
+  --merge-method ta \
   --checkpoint-root checkpoints \
   --datasets sun397 stanford_cars resisc45 eurosat svhn gtsrb mnist dtd \
   --drop-rate 0.9 \
-  --top-k 20 \
-  --merge-func dis-sum \
   --scale 0.3 \
   --seed 2033 \
   --output checkpoints/dare_ties/encoder_8datasets_drop0.9_k20_scale0.3.pt \
@@ -125,11 +123,9 @@ python eval.py \
 
 ```bash
 python -m model_merging.nan_merge \
-  --merge-method ties \
+  --merge-method ta \
   --checkpoint-root checkpoints \
   --datasets sun397 stanford_cars resisc45 eurosat svhn gtsrb mnist dtd \
-  --top-k 20 \
-  --merge-func dis-sum \
   --scale 0.3 \
   --output checkpoints/nan_ties/encoder_8datasets_k20_scale0.3.pt \
   --overwrite
