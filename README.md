@@ -1,21 +1,20 @@
 # MMCR: Sequential Layer-wise Model Merging via Reinforcement Learning
 
-MMCR is a reinforcement-learning-based framework for task-vector model merging on Vision Transformer encoders. Instead of using a single global merging coefficient, MMCR learns sequential non-negative layer-wise coefficients over TIES-selected task vectors, allowing each transformer layer to adaptively control how much information is merged from each source task.
+[![Project Page](https://img.shields.io/badge/MMCR-Page-2ea44f)](https://fangfangirl.github.io/RL_final/)
+[![Report](https://img.shields.io/badge/MMCR-Report-yellow)](https://fangfangirl.github.io/RL_final/static/pdfs/RL_report.pdf)
+[![Poster](https://img.shields.io/badge/MMCR-Poster-red)](https://fangfangirl.github.io/RL_final/static/pdfs/RL_poster.pdf)
 
-The default setting uses CLIP ViT-L/14 source encoders across eight visual recognition datasets: SUN397, Stanford Cars, RESISC45, EuroSAT, SVHN, GTSRB, MNIST, and DTD. MMCR optimizes the merging policy with an entropy-based reward and supports GRPO/RLOO, PPO-GAE, and GRPO-style variants (GSPO-like, Dr.GRPO-like, and DAPO-lite).
-
-Compared with strong task-vector merging baselines, MMCR achieves the best average accuracy in the eight-dataset setting, improving the average accuracy over TIES and AdaMerging while maintaining strong per-dataset performance.
-
-For a visual overview of the motivation, method, experimental setup, results, runtime analysis, and ablation studies, see the [project page](https://fangfangirl.github.io/RL_final/).
+MMCR learns sequential non-negative layer-wise coefficients for task-vector based Vision Transformer model merging. Using TIES-selected task vectors, MMCR optimizes the merge policy with reinforcement learning and achieves the highest average accuracy in the eight-dataset CLIP ViT-L/14 merging benchmark.
 
 ## Main Results
 
-| Method | SUN397 | Cars | RESISC45 | EuroSAT | SVHN | GTSRB | MNIST | DTD | Avg. |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| TIES | 76.11 | 83.93 | 83.65 | 80.66 | 84.70 | 89.14 | 89.29 | 65.53 | 81.63 |
-| AdaMerging-300 | 78.20 | 85.56 | 87.67 | 83.50 | 68.45 | 86.81 | 61.74 | 70.96 | 77.86 |
-| AdaMerging-500 | 78.71 | 87.58 | **90.21** | **88.14** | 88.13 | 89.37 | 91.45 | 72.87 | 85.81 |
-| **MMCR (ours)** | 77.57 | **89.11** | 89.06 | 85.72 | **90.65** | **89.96** | **92.54** | **76.64** | **86.41** |
+| Method | SUN397 | Cars | RESISC45 | EuroSAT | SVHN | GTSRB | MNIST | DTD | Avg. | Time (min) |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| TIES | 76.11 | 83.93 | 83.65 | 80.66 | 84.70 | 89.14 | 89.29 | 65.53 | 81.63 | 3.21 |
+| AdaMerging-300 | 78.20 | 85.56 | 87.67 | 83.50 | 68.45 | 86.81 | 61.74 | 70.96 | 77.86 | 185.00 |
+| AdaMerging-500 | **78.71** | 87.58 | 90.21 | 88.14 | 88.13 | 89.37 | 91.45 | 72.87 | 85.81 | 356.87 |
+| AdaMerging-600 | 78.70 | 87.66 | **90.62** | **88.78** | 89.08 | 89.79 | **92.61** | 73.67 | 86.36 | 418.90 |
+| **MMCR (ours)** | 77.57 | **89.11** | 89.06 | 85.72 | **90.65** | **89.96** | 92.54 | **76.64** | **86.41** | **245.17** |
 
 The checkpoint corresponding to the **86.41 average accuracy** result is available on Hugging Face: [RL-final-MMCR-best](https://huggingface.co/jimmy0214/RL-final-MMCR-best/tree/main)
 
