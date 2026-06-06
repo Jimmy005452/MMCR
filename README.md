@@ -2,7 +2,7 @@
 
 MMCR is a reinforcement-learning-based framework for task-vector model merging on Vision Transformer encoders. Instead of using a single global merging coefficient, MMCR learns sequential non-negative layer-wise coefficients over TIES-selected task vectors, allowing each transformer layer to adaptively control how much information is merged from each source task.
 
-The default setting uses CLIP ViT-L/14 source encoders across eight visual recognition datasets: SUN397, Stanford Cars, RESISC45, EuroSAT, SVHN, GTSRB, MNIST, and DTD. MMCR optimizes the merging policy with an entropy-based reward and supports GRPO/RLOO, PPO-GAE, and GRPO-style variants including GSPO-like, Dr.GRPO-like, and DAPO-lite.
+The default setting uses CLIP ViT-L/14 source encoders across eight visual recognition datasets: SUN397, Stanford Cars, RESISC45, EuroSAT, SVHN, GTSRB, MNIST, and DTD. MMCR optimizes the merging policy with an entropy-based reward and supports GRPO/RLOO, PPO-GAE, and GRPO-style variants (GSPO-like, Dr.GRPO-like, and DAPO-lite).
 
 Compared with strong task-vector merging baselines, MMCR achieves the best average accuracy in the eight-dataset setting, improving the average accuracy over TIES and AdaMerging while maintaining strong per-dataset performance.
 
